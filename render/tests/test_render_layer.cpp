@@ -22,7 +22,7 @@
 /* ─── Tests ─────────────────────────────────────────────────── */
 
 TEST(layer_id_enum_count) {
-    EXPECT_EQ((int)RenderLayerID::COUNT, 10);
+    EXPECT_EQ((int)RenderLayerID::COUNT, 11);
     PASS();
 }
 

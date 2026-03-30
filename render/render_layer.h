@@ -21,6 +21,7 @@ enum class RenderLayerID : uint8_t {
     UI_POWER,         // Power bar
     UI_TAB,           // Credits / EVA tab
     UI_OVERLAY,       // Messages, action menu, tooltips
+    UI_OPTIONS,       // In-game options dialog (topmost UI)
     COUNT
 };
 
