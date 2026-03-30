@@ -66,10 +66,18 @@ void RenderCompositor::Configure_Layer(const RenderLayerDesc& desc)
     ld.configured = true;
 }
 
+// Global accessor for engine logic (scrolling, clamping)
+static float g_render_world_zoom = 1.0f;
+float Render_Get_World_Zoom()
+{
+    return g_render_world_zoom;
+}
+
 void RenderCompositor::Set_World_Zoom(float zoom)
 {
     if (zoom <= 0.0f) return;
     impl_->world_zoom = zoom;
+    g_render_world_zoom = zoom;
 
     // Mark all world layers dirty when zoom changes
     for (int i = 0; i <= static_cast<int>(RenderLayerID::WORLD_SHROUD); i++) {
@@ -187,10 +195,20 @@ void RenderCompositor::Composite()
         bool is_world = (i <= static_cast<int>(RenderLayerID::WORLD_SHROUD));
 
         if (is_world && impl_->world_zoom != 1.0f) {
+            int dx = ld.desc.offset_x;
+            int dy = ld.desc.offset_y;
+
+            // Center world layer if scaled size is smaller than output area
+            int scaled_w = static_cast<int>(ld.desc.width * impl_->world_zoom);
+            int scaled_h = static_cast<int>(ld.desc.height * impl_->world_zoom);
+            int avail_w = ow - ld.desc.offset_x;
+            int avail_h = oh - ld.desc.offset_y;
+            if (scaled_w < avail_w) dx += (avail_w - scaled_w) / 2;
+            if (scaled_h < avail_h) dy += (avail_h - scaled_h) / 2;
+
             Blit_Scaled(ld.buffer, ld.desc.width, ld.desc.height,
                         impl_->output_buffer, ow, oh, op,
-                        ld.desc.offset_x, ld.desc.offset_y,
-                        impl_->world_zoom);
+                        dx, dy, impl_->world_zoom);
         } else {
             Blit_Direct(ld.buffer, ld.desc.width, ld.desc.height,
                         impl_->output_buffer, ow, oh, op,
@@ -222,4 +240,24 @@ int RenderCompositor::Get_Layer_Height(RenderLayerID layer) const
     if (idx < 0 || idx >= static_cast<int>(RenderLayerID::COUNT)) return 0;
     if (!impl_->layers[idx].configured) return 0;
     return impl_->layers[idx].desc.height;
+}
+
+void* RenderCompositor::Get_Output()
+{
+    return impl_->output_buffer;
+}
+
+const void* RenderCompositor::Get_Output() const
+{
+    return impl_->output_buffer;
+}
+
+int RenderCompositor::Get_Output_Width() const
+{
+    return impl_->output_width;
+}
+
+int RenderCompositor::Get_Output_Height() const
+{
+    return impl_->output_height;
 }

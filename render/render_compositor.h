@@ -60,9 +60,23 @@ public:
     int Get_Layer_Width(RenderLayerID layer) const;
     int Get_Layer_Height(RenderLayerID layer) const;
 
+    /// Get the composited RGBA output buffer.
+    /// Writable for direct passthrough (menus), read-only after Composite().
+    void* Get_Output();
+    const void* Get_Output() const;
+
+    int Get_Output_Width() const;
+    int Get_Output_Height() const;
+
 private:
     struct Impl;
     Impl* impl_;
 };
+
+/**
+ * Global accessor for engine logic (scrolling, clamping).
+ * Returns the zoom factor from the last Set_World_Zoom call.
+ */
+float Render_Get_World_Zoom();
 
 #endif // RENDER_RENDER_COMPOSITOR_H
