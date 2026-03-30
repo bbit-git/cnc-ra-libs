@@ -57,15 +57,34 @@ public:
      */
     void* Get_Layer_Buffer(RenderLayerID layer);
 
+    /**
+     * @return Configured width of a layer, or 0 if unavailable.
+     */
     int Get_Layer_Width(RenderLayerID layer) const;
+
+    /**
+     * @return Configured height of a layer, or 0 if unavailable.
+     */
     int Get_Layer_Height(RenderLayerID layer) const;
 
-    /// Get the composited RGBA output buffer.
-    /// Writable for direct passthrough (menus), read-only after Composite().
+    /**
+     * @return Writable composited RGBA output buffer.
+     */
     void* Get_Output();
+
+    /**
+     * @return Read-only composited RGBA output buffer.
+     */
     const void* Get_Output() const;
 
+    /**
+     * @return Output surface width in pixels.
+     */
     int Get_Output_Width() const;
+
+    /**
+     * @return Output surface height in pixels.
+     */
     int Get_Output_Height() const;
 
 private:

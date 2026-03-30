@@ -24,6 +24,9 @@ public:
      */
     bool Init(int width, int height);
 
+    /**
+     * Release GL resources and destroy the context.
+     */
     void Shutdown();
 
     /**
@@ -50,6 +53,10 @@ public:
      * Update an existing texture (sub-image upload).
      */
     void Update_Indexed(uint32_t tex_id, const void* pixels, int width, int height);
+
+    /**
+     * Update an existing RGBA texture (sub-image upload).
+     */
     void Update_RGBA(uint32_t tex_id, const void* pixels, int width, int height);
 
     /**
