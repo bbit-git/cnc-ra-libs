@@ -16,6 +16,10 @@
 #include "test_framework.h"
 #include "../gl/gl_sprite_batch.h"
 
+/* ─── Mocks for engine symbols ─────────────────────────────── */
+#include <SDL3/SDL.h>
+SDL_Window* g_window = nullptr;
+
 /* ─── Offline tests (no GL context) ─────────────────────────── */
 
 TEST(batch_construct_destroy) {

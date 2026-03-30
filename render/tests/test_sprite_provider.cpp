@@ -22,6 +22,27 @@
 #include "../sprite_provider.h"
 #include "../legacy_sprite_provider.h"
 
+/* ─── Mocks for engine symbols ─────────────────────────────── */
+#include <cstdint>
+
+extern "C" {
+    long _ShapeBufferSize = 0;
+    char* _ShapeBuffer = nullptr;
+    char* BigShapeBufferStart = nullptr;
+    int  UseBigShapeBuffer = 0;
+}
+
+unsigned long Build_Frame(void const*, unsigned short, void*) { return 0; }
+unsigned short Get_Build_Frame_Count(void const*) { return 0; }
+unsigned short Get_Build_Frame_Width(void const*) { return 0; }
+unsigned short Get_Build_Frame_Height(void const*) { return 0; }
+void* Get_Shape_Header_Data(void*) { return nullptr; }
+void* Extract_Shape(void const*, int) { return nullptr; }
+int Extract_Shape_Count(void const*) { return 0; }
+int Get_Shape_Width(void const*) { return 0; }
+int Get_Shape_Height(void const*) { return 0; }
+unsigned long LCW_Uncompress(void const*, void*, unsigned long, unsigned long) { return 0; }
+
 /* ─── Interface contract tests (no real data needed) ─────── */
 
 TEST(sprite_frame_struct_size) {

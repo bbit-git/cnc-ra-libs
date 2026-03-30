@@ -17,6 +17,10 @@
 
 #include <cstdlib>
 
+/* ─── Mocks for engine symbols ─────────────────────────────── */
+#include <SDL3/SDL.h>
+SDL_Window* g_window = nullptr;
+
 /* ─── Offline tests (no GL context) ─────────────────────────── */
 
 TEST(gl_renderer_construct_destroy) {
