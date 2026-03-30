@@ -117,14 +117,14 @@ engine/libs/render/
 ### Step 4: Texture Atlas Builder (GPU preparation) ✓
 
 **Files:** `texture_atlas.h/.cpp`
-**Status:** Implemented 2026-03-29
+**Status:** Verified 2026-03-30
 
 **Tasks:**
 - [x] Implement bin-packing algorithm (shelf or maxrects, for power-of-2 pages)
 - [x] Accept RGBA frames from either provider (legacy after palette conversion, or HD directly)
 - [x] Track AtlasRegion per frame (atlas page ID, UV coordinates)
 - [x] Finalize: produce atlas page pixel buffers ready for GPU upload
-- [ ] Test: pack 100+ frames into atlas, verify no overlap, correct UV lookups
+- [x] Test: pack 100+ frames into atlas, verify no overlap, correct UV lookups
 
 **Implementation notes:**
 - Shelf-based packing: simple, fast, good enough for game sprite atlases
@@ -204,7 +204,7 @@ engine/libs/render/
 ### Step 7: GL Sprite Batch (GPU sprite rendering) ✓
 
 **Files:** `gl/gl_sprite_batch.h/.cpp`
-**Status:** Implemented 2026-03-29 (standalone; CC_Draw_Shape integration pending)
+**Status:** Verified 2026-03-30 (Offline tests)
 
 **Tasks:**
 - [x] Implement sprite batch: collect quads per frame, sort by atlas page
@@ -297,16 +297,16 @@ After:
 
 | Step | Description | Status | Notes |
 |------|-------------|--------|-------|
-| 1 | MEG reader + META parser | ✓ Done | Standalone test pending |
-| 2 | ISpriteProvider + Legacy adapter | ✓ Done | Integration test pending |
-| 3 | HD sprite provider | ✓ Done | Asset validation pending |
-| 4 | Texture atlas builder | ✓ Done | Visual packing test pending |
-| 5 | Render layers + compositor | ✓ Done | Engine integration pending |
-| 6 | GL ES renderer | ✓ Done | Platform integration pending |
-| 7 | GL sprite batch | ✓ Done | CC_Draw_Shape integration pending |
-| 8 | House color shader | ✓ Done | Complete |
+| 1 | MEG reader + META parser | ✓ Verified | Standalone tests passing |
+| 2 | ISpriteProvider + Legacy adapter | ✓ Verified | Mocked engine symbols |
+| 3 | HD sprite provider | ✓ Verified | Mocked MEG data |
+| 4 | Texture atlas builder | ✓ Verified | 100+ frames packing OK |
+| 5 | Render layers + compositor | ✓ Verified | CPU blit + zoom OK |
+| 6 | GL ES renderer | ✓ Verified | Offline tests passing |
+| 7 | GL sprite batch | ✓ Verified | Offline tests passing |
+| 8 | House color shader | ✓ Verified | Complete |
 
-**All 8 steps implemented.** Remaining work is integration and testing (see below).
+**All 8 steps implemented and verified via standalone tests.** Remaining work is integration.
 
 ## Build System
 
@@ -357,3 +357,4 @@ These stay where they are:
 - `engine/libs/graphics/compress.cpp` — LCW/XOR codecs (called by shp.cpp)
 - `platform.sdl3/*/sdl3_present.cpp` — SDL presentation (replaced by GL path, kept as fallback)
 - `engine/*/modern.src/display.cpp` — game-specific rendering logic (calls into this library)
+ary)
