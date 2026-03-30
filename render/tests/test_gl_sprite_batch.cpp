@@ -106,6 +106,27 @@ TEST(batch_multiple_atlas_pages) {
     PASS();
 }
 
+TEST(batch_large_single_atlas_splits_draw_calls) {
+    GLSpriteBatch batch;
+    batch.Begin();
+
+    for (int i = 0; i < 4097; i++) {
+        SpriteBatchEntry entry = {};
+        entry.region.atlas_id = 0;
+        entry.region.w = 8; entry.region.h = 8;
+        entry.dst_x = (float)(i % 256);
+        entry.dst_y = (float)(i / 256);
+        entry.scale_x = 1.0f; entry.scale_y = 1.0f;
+        entry.house_hue = -1.0f;
+        batch.Add(entry);
+    }
+
+    batch.Flush();
+    EXPECT_EQ(batch.Sprite_Count(), 4097);
+    EXPECT_EQ(batch.Draw_Call_Count(), 2);
+    PASS();
+}
+
 TEST(batch_repeated_begin_flush) {
     GLSpriteBatch batch;
 
