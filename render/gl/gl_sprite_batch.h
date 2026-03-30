@@ -18,7 +18,7 @@ struct SpriteBatchEntry {
     float       scale_x;   // Horizontal scale (1.0 = normal)
     float       scale_y;   // Vertical scale
     float       house_hue; // House color hue (-1.0 = no remap)
-    uint8_t     flags;     // Flip H/V, ghost, shadow
+    uint8_t     flags;     // Flip H/V plus ghost/shadow effect bits
     uint8_t     fade;      // Fade level (0 = none, 255 = full)
 };
 
@@ -36,6 +36,16 @@ public:
      * Add a sprite to the batch.
      */
     void Add(const SpriteBatchEntry& entry);
+
+    /**
+     * Associate an atlas page ID with a GL texture handle.
+     */
+    void Set_Page_Texture(uint16_t atlas_id, uint32_t texture_id);
+
+    /**
+     * Remove all atlas page texture bindings.
+     */
+    void Clear_Page_Textures();
 
     /**
      * Flush all queued sprites to the GPU.

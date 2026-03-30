@@ -18,12 +18,13 @@
 #include <vector>
 #include <algorithm>
 
-// Batch vertex: position + UV + house hue + fade
+// Batch vertex: position + UV + house hue + effect + opacity
 struct BatchVertex {
     float x, y;
     float u, v;
     float house_hue;
-    float fade;
+    float effect;
+    float opacity;
 };
 
 // Maximum quads per flush
@@ -36,10 +37,12 @@ static const char* batch_vert_src = R"(
     attribute vec2 a_pos;
     attribute vec2 a_uv;
     attribute float a_house_hue;
-    attribute float a_fade;
+    attribute float a_effect;
+    attribute float a_opacity;
     varying vec2 v_uv;
     varying float v_house_hue;
-    varying float v_fade;
+    varying float v_effect;
+    varying float v_opacity;
     uniform vec2 u_viewport;
     void main() {
         vec2 p = a_pos / u_viewport * 2.0 - 1.0;
@@ -47,7 +50,8 @@ static const char* batch_vert_src = R"(
         gl_Position = vec4(p, 0.0, 1.0);
         v_uv = a_uv;
         v_house_hue = a_house_hue;
-        v_fade = a_fade;
+        v_effect = a_effect;
+        v_opacity = a_opacity;
     }
 )";
 
@@ -55,7 +59,8 @@ static const char* batch_frag_src = R"(
     precision mediump float;
     varying vec2 v_uv;
     varying float v_house_hue;
-    varying float v_fade;
+    varying float v_effect;
+    varying float v_opacity;
     uniform sampler2D u_atlas;
 
     vec3 rgb2hsv(vec3 c) {
@@ -76,18 +81,40 @@ static const char* batch_frag_src = R"(
     void main() {
         vec4 color = texture2D(u_atlas, v_uv);
         if (color.a < 0.01) discard;
+        if (v_effect < 0.5 && v_opacity <= 0.0) {
+            color.a = 1.0;
+        }
 
         if (v_house_hue >= 0.0) {
-            float green_ratio = color.g / (max(color.r, max(color.g, color.b)) + 0.001);
-            if (green_ratio > 0.6 && color.g > 0.3) {
+            float max_ch = max(color.r, max(color.g, color.b));
+            float rb_avg = (color.r + color.b) * 0.5;
+            float dominance = color.g / (rb_avg + 0.001);
+            if (max_ch > 0.05 && dominance >= 2.0 && color.g > 0.2) {
                 vec3 hsv = rgb2hsv(color.rgb);
                 hsv.x = v_house_hue;
                 color.rgb = hsv2rgb(hsv);
             }
         }
 
-        if (v_fade > 0.0) {
-            color.rgb = mix(color.rgb, vec3(0.0), v_fade);
+        if (v_effect > 5.5) {
+            color.rgb = mix(color.rgb, vec3(0.0), 0.35);
+            color.a *= v_opacity;
+        } else if (v_effect > 4.5) {
+            color.rgb = mix(color.rgb, vec3(1.0, 1.0, 0.85), 0.5);
+            color.a *= v_opacity;
+        } else if (v_effect > 3.5) {
+            color.rgb = mix(color.rgb, vec3(0.75, 0.95, 1.0), 0.45);
+            color.a *= v_opacity;
+        } else if (v_effect > 2.5) {
+            color.rgb = mix(color.rgb, vec3(1.0), 0.7);
+            color.a *= v_opacity;
+        } else if (v_effect > 1.5) {
+            color.rgb = vec3(0.0);
+            color.a *= v_opacity;
+        } else if (v_effect > 0.5) {
+            color.a *= v_opacity;
+        } else if (v_opacity > 0.0) {
+            color.rgb = mix(color.rgb, vec3(0.0), v_opacity);
         }
 
         gl_FragColor = color;
@@ -113,7 +140,8 @@ struct GLSpriteBatch::Impl {
     GLint  a_pos    = -1;
     GLint  a_uv     = -1;
     GLint  a_house  = -1;
-    GLint  a_fade   = -1;
+    GLint  a_effect = -1;
+    GLint  a_opacity = -1;
     GLint  u_viewport = -1;
     GLint  u_atlas  = -1;
 
@@ -121,6 +149,7 @@ struct GLSpriteBatch::Impl {
     GLuint ibo      = 0;
 
     std::vector<SpriteBatchEntry> entries;
+    std::vector<GLuint> page_textures;
     int    draw_calls = 0;
     int    sprite_count = 0;
     int    viewport_w = 0;
@@ -148,7 +177,8 @@ struct GLSpriteBatch::Impl {
         a_pos   = glGetAttribLocation(prog, "a_pos");
         a_uv    = glGetAttribLocation(prog, "a_uv");
         a_house = glGetAttribLocation(prog, "a_house_hue");
-        a_fade  = glGetAttribLocation(prog, "a_fade");
+        a_effect = glGetAttribLocation(prog, "a_effect");
+        a_opacity = glGetAttribLocation(prog, "a_opacity");
         u_viewport = glGetUniformLocation(prog, "u_viewport");
         u_atlas = glGetUniformLocation(prog, "u_atlas");
 
@@ -176,12 +206,6 @@ struct GLSpriteBatch::Impl {
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
                      indices.size() * sizeof(uint16_t),
                      indices.data(), GL_STATIC_DRAW);
-
-        // Get viewport size
-        GLint vp[4];
-        glGetIntegerv(GL_VIEWPORT, vp);
-        viewport_w = vp[2];
-        viewport_h = vp[3];
 
         initialized = true;
         return true;
@@ -213,8 +237,23 @@ void GLSpriteBatch::Add(const SpriteBatchEntry& entry)
     impl_->entries.push_back(entry);
 }
 
+void GLSpriteBatch::Set_Page_Texture(uint16_t atlas_id, uint32_t texture_id)
+{
+    if (atlas_id >= impl_->page_textures.size()) {
+        impl_->page_textures.resize(atlas_id + 1, 0);
+    }
+    impl_->page_textures[atlas_id] = texture_id;
+}
+
+void GLSpriteBatch::Clear_Page_Textures()
+{
+    impl_->page_textures.clear();
+}
+
 void GLSpriteBatch::Flush()
 {
+    impl_->draw_calls = 0;
+    impl_->sprite_count = static_cast<int>(impl_->entries.size());
     if (impl_->entries.empty()) return;
 
     // Sort by atlas page for batching
@@ -223,24 +262,28 @@ void GLSpriteBatch::Flush()
                   return a.region.atlas_id < b.region.atlas_id;
               });
 
-    // Count sprites and draw calls (works even without GL for testing)
+    // Count actual draw calls, including chunk splits when a page exceeds MAX_QUADS.
     {
         size_t idx = 0;
         while (idx < impl_->entries.size()) {
             uint16_t cur = impl_->entries[idx].region.atlas_id;
-            int count = 0;
+            size_t count = 0;
             while (idx < impl_->entries.size() &&
                    impl_->entries[idx].region.atlas_id == cur) {
                 count++;
                 idx++;
             }
-            impl_->sprite_count += count;
-            impl_->draw_calls++;
+            impl_->draw_calls += static_cast<int>((count + MAX_QUADS - 1) / MAX_QUADS);
         }
     }
 
     // GL rendering (skip if no GL context available)
     if (!impl_->Init_GL()) return;
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    impl_->viewport_w = vp[2];
+    impl_->viewport_h = vp[3];
 
     glUseProgram(impl_->prog);
     glUniform2f(impl_->u_viewport,
@@ -249,13 +292,27 @@ void GLSpriteBatch::Flush()
     glUniform1i(impl_->u_atlas, 0);
     glActiveTexture(GL_TEXTURE0);
 
+    GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    GLint blend_src_rgb = GL_ONE;
+    GLint blend_dst_rgb = GL_ZERO;
+    GLint blend_src_alpha = GL_ONE;
+    GLint blend_dst_alpha = GL_ZERO;
+    glGetIntegerv(GL_BLEND_SRC_RGB, &blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blend_src_alpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blend_dst_alpha);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
     glBindBuffer(GL_ARRAY_BUFFER, impl_->vbo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, impl_->ibo);
 
     glEnableVertexAttribArray(impl_->a_pos);
     glEnableVertexAttribArray(impl_->a_uv);
     if (impl_->a_house >= 0) glEnableVertexAttribArray(impl_->a_house);
-    if (impl_->a_fade >= 0)  glEnableVertexAttribArray(impl_->a_fade);
+    if (impl_->a_effect >= 0) glEnableVertexAttribArray(impl_->a_effect);
+    if (impl_->a_opacity >= 0) glEnableVertexAttribArray(impl_->a_opacity);
 
     int stride = sizeof(BatchVertex);
     glVertexAttribPointer(impl_->a_pos, 2, GL_FLOAT, GL_FALSE, stride,
@@ -265,9 +322,12 @@ void GLSpriteBatch::Flush()
     if (impl_->a_house >= 0)
         glVertexAttribPointer(impl_->a_house, 1, GL_FLOAT, GL_FALSE, stride,
                               reinterpret_cast<void*>(16));
-    if (impl_->a_fade >= 0)
-        glVertexAttribPointer(impl_->a_fade, 1, GL_FLOAT, GL_FALSE, stride,
+    if (impl_->a_effect >= 0)
+        glVertexAttribPointer(impl_->a_effect, 1, GL_FLOAT, GL_FALSE, stride,
                               reinterpret_cast<void*>(20));
+    if (impl_->a_opacity >= 0)
+        glVertexAttribPointer(impl_->a_opacity, 1, GL_FLOAT, GL_FALSE, stride,
+                              reinterpret_cast<void*>(24));
 
     // Flush in batches per atlas page
     size_t i = 0;
@@ -298,12 +358,19 @@ void GLSpriteBatch::Flush()
             if (e.flags & 0x02) { float t = v0; v0 = v1; v1 = t; }
 
             float hue = e.house_hue;
-            float fade = e.fade / 255.0f;
+            float effect = 0.0f;
+            if (e.flags & 0x04) effect = 1.0f;
+            if (e.flags & 0x08) effect = 2.0f;
+            if (e.flags & 0x10) effect = 3.0f;
+            if (e.flags & 0x20) effect = 4.0f;
+            if (e.flags & 0x40) effect = 5.0f;
+            if (e.flags & 0x80) effect = 6.0f;
+            float opacity = e.fade / 255.0f;
 
-            verts.push_back({x0, y0, u0, v0, hue, fade});
-            verts.push_back({x1, y0, u1, v0, hue, fade});
-            verts.push_back({x0, y1, u0, v1, hue, fade});
-            verts.push_back({x1, y1, u1, v1, hue, fade});
+            verts.push_back({x0, y0, u0, v0, hue, effect, opacity});
+            verts.push_back({x1, y0, u1, v0, hue, effect, opacity});
+            verts.push_back({x0, y1, u0, v1, hue, effect, opacity});
+            verts.push_back({x1, y1, u1, v1, hue, effect, opacity});
 
             quad_count++;
             i++;
@@ -313,9 +380,13 @@ void GLSpriteBatch::Flush()
         glBufferSubData(GL_ARRAY_BUFFER, 0,
                         verts.size() * sizeof(BatchVertex), verts.data());
 
-        // Bind atlas page texture (caller manages texture IDs externally)
-        // For now we assume atlas page textures are bound sequentially
-        // The actual binding is done by the integration layer
+        if (current_atlas < impl_->page_textures.size()) {
+            GLuint texture = impl_->page_textures[current_atlas];
+            glBindTexture(GL_TEXTURE_2D, texture);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+
         glDrawElements(GL_TRIANGLES,
                        quad_count * INDICES_PER_QUAD,
                        GL_UNSIGNED_SHORT, nullptr);
@@ -324,7 +395,12 @@ void GLSpriteBatch::Flush()
     glDisableVertexAttribArray(impl_->a_pos);
     glDisableVertexAttribArray(impl_->a_uv);
     if (impl_->a_house >= 0) glDisableVertexAttribArray(impl_->a_house);
-    if (impl_->a_fade >= 0)  glDisableVertexAttribArray(impl_->a_fade);
+    if (impl_->a_effect >= 0) glDisableVertexAttribArray(impl_->a_effect);
+    if (impl_->a_opacity >= 0) glDisableVertexAttribArray(impl_->a_opacity);
+    glBlendFuncSeparate(blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha);
+    if (!blend_enabled) {
+        glDisable(GL_BLEND);
+    }
 }
 
 int GLSpriteBatch::Draw_Call_Count() const
