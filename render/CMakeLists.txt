@@ -15,6 +15,7 @@ add_library(render_core STATIC
     ${RENDER_DIR}/meg_reader.cpp
     ${RENDER_DIR}/meta_parser.cpp
     ${RENDER_DIR}/hd_sprite_provider.cpp
+    ${RENDER_DIR}/dds_reader.cpp
     ${RENDER_DIR}/texture_atlas.cpp
     ${RENDER_DIR}/render_compositor.cpp
 )
