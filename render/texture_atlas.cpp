@@ -94,6 +94,11 @@ struct AtlasPage {
 struct FrameRecord {
     uint16_t atlas_id;
     uint16_t x, y, w, h;
+    int16_t  origin_x;
+    int16_t  origin_y;
+    uint16_t canvas_w;
+    uint16_t canvas_h;
+    float    native_scale;
 };
 
 struct TextureAtlas::Impl {
@@ -122,7 +127,10 @@ void TextureAtlas::Init(int page_size)
     impl_->page_size = page_size;
 }
 
-AtlasFrameID TextureAtlas::Add_Frame(const void* pixels, int width, int height)
+AtlasFrameID TextureAtlas::Add_Frame(const void* pixels, int width, int height,
+                                     int origin_x, int origin_y,
+                                     int canvas_w, int canvas_h,
+                                     float native_scale)
 {
     if (impl_->finalized) return static_cast<uint32_t>(-1);
     if (!pixels || width <= 0 || height <= 0) return static_cast<uint32_t>(-1);
@@ -159,6 +167,11 @@ AtlasFrameID TextureAtlas::Add_Frame(const void* pixels, int width, int height)
     rec.y = static_cast<uint16_t>(py);
     rec.w = static_cast<uint16_t>(width);
     rec.h = static_cast<uint16_t>(height);
+    rec.origin_x = static_cast<int16_t>(origin_x);
+    rec.origin_y = static_cast<int16_t>(origin_y);
+    rec.canvas_w = static_cast<uint16_t>(canvas_w > 0 ? canvas_w : width);
+    rec.canvas_h = static_cast<uint16_t>(canvas_h > 0 ? canvas_h : height);
+    rec.native_scale = native_scale > 0.0f ? native_scale : 1.0f;
     impl_->frames.push_back(rec);
 
     return static_cast<AtlasFrameID>(impl_->frames.size() - 1);
@@ -181,6 +194,11 @@ bool TextureAtlas::Get_Region(AtlasFrameID id, AtlasRegion& region_out) const
     region_out.y = rec.y;
     region_out.w = rec.w;
     region_out.h = rec.h;
+    region_out.origin_x = rec.origin_x;
+    region_out.origin_y = rec.origin_y;
+    region_out.canvas_w = rec.canvas_w;
+    region_out.canvas_h = rec.canvas_h;
+    region_out.native_scale = rec.native_scale;
     region_out.u0 = rec.x / ps;
     region_out.v0 = rec.y / ps;
     region_out.u1 = (rec.x + rec.w) / ps;

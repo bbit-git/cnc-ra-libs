@@ -1,7 +1,7 @@
 /**
- * HDSpriteProvider - ISpriteProvider for remastered MEG/TGA assets.
+ * HDSpriteProvider - ISpriteProvider for remastered MEG/DDS assets.
  *
- * Reads TGA frames + META crop data from MEG archives.
+ * Reads DDS frames + META crop data from MEG archives, with TGA fallback.
  * Returns 32-bit RGBA pixel data.
  */
 
@@ -10,8 +10,7 @@
 
 #include "sprite_provider.h"
 
-class MegReader;
-class TextureAtlas;
+struct HDSpriteProvider_Impl;
 
 class HDSpriteProvider : public ISpriteProvider {
 public:
@@ -26,19 +25,29 @@ public:
     bool Open(const char* meg_path);
 
     /**
-     * Load a tileset XML that maps game entity names to TGA filenames.
+     * Load a tileset XML that maps game entity names to frame filenames.
      * @param xml_path  Path to tileset XML (e.g. TD_UNITS.XML) within the MEG
      * @return true if tileset was parsed successfully
      */
     bool Load_Tileset(const char* xml_path);
+
+    /**
+     * Load a tileset XML from a different MEG archive (e.g. CONFIG.MEG).
+     */
+    bool Load_Tileset_From_Meg(const char* meg_path, const char* xml_path);
+
+    /**
+     * Set active theater for terrain tiles (e.g. "DESERT", "TEMPERATE").
+     * This scans the MEG for terrain tiles matching the theater and caches them.
+     */
+    void Set_Theater(const char* theater);
 
     bool Get_Frame(const void* shape_id, int frame, SpriteFrame& frame_out) override;
     int  Get_Frame_Count(const void* shape_id) override;
     SpritePixelFormat Native_Format() const override { return SpritePixelFormat::RGBA_32BIT; }
 
 private:
-    MegReader*    meg_;
-    TextureAtlas* atlas_;
+    HDSpriteProvider_Impl* impl_;
 };
 
 #endif // RENDER_HD_SPRITE_PROVIDER_H

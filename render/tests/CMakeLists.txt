@@ -22,6 +22,14 @@ add_executable(test_meta_parser
 )
 target_include_directories(test_meta_parser PRIVATE ${RENDER_SRC})
 
+add_executable(test_zip_reader
+    test_zip_reader.cpp
+    ${RENDER_SRC}/dds_reader.cpp
+    ${RENDER_SRC}/zip_reader.cpp
+    ${RENDER_SRC}/dds_reader.cpp
+)
+target_include_directories(test_zip_reader PRIVATE ${RENDER_SRC})
+
 # ─── Step 2: ISpriteProvider + Legacy adapter ────────────────────────
 
 add_executable(test_sprite_provider
@@ -37,6 +45,8 @@ add_executable(test_hd_sprite_provider
     ${RENDER_SRC}/hd_sprite_provider.cpp
     ${RENDER_SRC}/meg_reader.cpp
     ${RENDER_SRC}/meta_parser.cpp
+    ${RENDER_SRC}/zip_reader.cpp
+    ${RENDER_SRC}/dds_reader.cpp
 )
 target_include_directories(test_hd_sprite_provider PRIVATE ${RENDER_SRC})
 
@@ -100,6 +110,7 @@ endif()
 enable_testing()
 add_test(NAME meg_reader       COMMAND test_meg_reader)
 add_test(NAME meta_parser      COMMAND test_meta_parser)
+add_test(NAME zip_reader       COMMAND test_zip_reader)
 add_test(NAME sprite_provider  COMMAND test_sprite_provider)
 add_test(NAME hd_sprite_provider COMMAND test_hd_sprite_provider)
 add_test(NAME texture_atlas    COMMAND test_texture_atlas)
@@ -110,3 +121,11 @@ if(SDL3_FOUND)
     add_test(NAME gl_renderer     COMMAND test_gl_renderer)
     add_test(NAME gl_sprite_batch COMMAND test_gl_sprite_batch)
 endif()
+
+add_executable(test_hd_terrain_provider test_hd_terrain_provider.cpp
+    ${RENDER_SRC}/hd_terrain_provider.cpp
+    ${RENDER_SRC}/meg_reader.cpp
+    ${RENDER_SRC}/meta_parser.cpp
+    ${RENDER_SRC}/dds_reader.cpp
+)
+target_include_directories(test_hd_terrain_provider PRIVATE ${RENDER_SRC})

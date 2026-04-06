@@ -117,6 +117,7 @@ bool LegacySpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFram
         frame_out.origin_y      = 0;
         frame_out.canvas_width  = w;
         frame_out.canvas_height = h;
+        frame_out.native_scale  = 1.0f;
         return true;
     } else {
         // KeyFrame format: Build_Frame → Get_Shape_Header_Data
@@ -139,6 +140,7 @@ bool LegacySpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFram
         frame_out.origin_y      = 0;
         frame_out.canvas_width  = w;
         frame_out.canvas_height = h;
+        frame_out.native_scale  = 1.0f;
         return true;
     }
 }

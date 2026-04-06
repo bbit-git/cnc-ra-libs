@@ -229,6 +229,12 @@ int MegReader::Entry_Count() const
     return static_cast<int>(impl_->entries.size());
 }
 
+const MegEntry* MegReader::Get_Entry(int index) const
+{
+    if (index < 0 || index >= static_cast<int>(impl_->entries.size())) return nullptr;
+    return &impl_->entries[index];
+}
+
 const char* MegReader::Get_Filename(uint16_t name_index) const
 {
     if (name_index >= impl_->filenames.size()) return nullptr;

@@ -67,6 +67,31 @@ TEST(atlas_single_frame) {
     EXPECT_EQ(region.atlas_id, 0);
     EXPECT_EQ(region.w, 32);
     EXPECT_EQ(region.h, 32);
+    EXPECT_EQ(region.origin_x, 0);
+    EXPECT_EQ(region.origin_y, 0);
+    EXPECT_EQ(region.canvas_w, 32);
+    EXPECT_EQ(region.canvas_h, 32);
+    EXPECT_EQ(region.native_scale, 1.0f);
+    PASS();
+}
+
+TEST(atlas_preserves_frame_metadata) {
+    TextureAtlas atlas;
+    atlas.Init(256);
+
+    auto pixels = make_rgba(32, 16, 0, 0, 255, 255);
+    AtlasFrameID id = atlas.Add_Frame(pixels.data(), 32, 16, -3, 5, 96, 48, 2.0f);
+    EXPECT_NE(id, (AtlasFrameID)-1);
+
+    atlas.Finalize();
+
+    AtlasRegion region;
+    EXPECT_TRUE(atlas.Get_Region(id, region));
+    EXPECT_EQ(region.origin_x, -3);
+    EXPECT_EQ(region.origin_y, 5);
+    EXPECT_EQ(region.canvas_w, 96);
+    EXPECT_EQ(region.canvas_h, 48);
+    EXPECT_EQ(region.native_scale, 2.0f);
     PASS();
 }
 

@@ -18,6 +18,11 @@ struct AtlasRegion {
     uint16_t atlas_id;   // Which atlas texture page
     uint16_t x, y;       // Pixel position within atlas
     uint16_t w, h;       // Pixel dimensions
+    int16_t  origin_x;   // Crop offset from the full canvas
+    int16_t  origin_y;   // Crop offset from the full canvas
+    uint16_t canvas_w;   // Full canvas width before crop
+    uint16_t canvas_h;   // Full canvas height before crop
+    float    native_scale; // Sprite pixels per legacy sprite pixel
     float    u0, v0;     // Normalized UV top-left
     float    u1, v1;     // Normalized UV bottom-right
 };
@@ -45,7 +50,10 @@ public:
      * @param height  Frame height
      * @return Frame ID for later lookup, or (uint32_t)-1 on failure
      */
-    AtlasFrameID Add_Frame(const void* pixels, int width, int height);
+    AtlasFrameID Add_Frame(const void* pixels, int width, int height,
+                           int origin_x = 0, int origin_y = 0,
+                           int canvas_w = 0, int canvas_h = 0,
+                           float native_scale = 1.0f);
 
     /**
      * Finalize all pages — no more frames can be added after this.

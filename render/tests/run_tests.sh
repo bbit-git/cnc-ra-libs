@@ -9,6 +9,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 
+# Load local environment overrides (not committed)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    # shellcheck disable=SC1091
+    set -a; source "$SCRIPT_DIR/.env"; set +a
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 cmake "$SCRIPT_DIR" -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -2

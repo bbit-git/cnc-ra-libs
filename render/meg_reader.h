@@ -59,6 +59,11 @@ public:
     void* Read_Alloc(const MegEntry* entry, size_t* size_out) const;
 
     int Entry_Count() const;
+    
+    /**
+     * Get an entry by index (0 to Entry_Count() - 1).
+     */
+    const MegEntry* Get_Entry(int index) const;
 
     /**
      * Get filename for an entry by its name_index.
