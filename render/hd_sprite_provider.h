@@ -46,6 +46,9 @@ public:
     int  Get_Frame_Count(const void* shape_id) override;
     SpritePixelFormat Native_Format() const override { return SpritePixelFormat::RGBA_32BIT; }
 
+    // Test hook for XML category detection.
+    static const char* Debug_Extract_Category(const char* xml_path);
+
 private:
     HDSpriteProvider_Impl* impl_;
 };

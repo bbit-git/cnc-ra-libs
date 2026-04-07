@@ -24,6 +24,9 @@
 
 #include <unordered_map>
 #include <string>
+#include <vector>
+
+static constexpr float TD_REMASTER_NATIVE_SCALE = 128.0f / 24.0f;
 
 // stb_image: use the copy bundled with SDL3
 #define STB_IMAGE_IMPLEMENTATION
@@ -52,6 +55,8 @@ struct TilesetEntry {
     std::string filename_pattern;  // e.g. "ART/TEXTURES/SRGB/TD/UNITS/HTANK"
     int         frame_count;
     std::string category;          // Derived from XML (e.g. "UNITS", "INFANTRY")
+    std::string root_texture_path; // e.g. "Tiberian_Dawn\\Terrain\\Desert"
+    std::vector<std::string> frame_files;
 };
 
 struct ZipCache {
@@ -115,58 +120,84 @@ bool HDSpriteProvider::Open(const char* meg_path)
     return true;
 }
 
-/// Minimal XML parser for <Tile><Key><Name>... and <Value><Frames><Frame>...
-static bool Parse_Tileset_XML(const char* xml, size_t len,
-                               std::unordered_map<uint32_t, TilesetEntry>& out)
+static bool extract_tag_value(const std::string& src, const char* tag,
+                              size_t start_pos, size_t end_pos, std::string& out_value)
 {
-    std::unordered_map<uint32_t, int> current_pass_frames;
+    std::string open_tag = std::string("<") + tag + ">";
+    std::string close_tag = std::string("</") + tag + ">";
+    size_t value_start = src.find(open_tag, start_pos);
+    if (value_start == std::string::npos || value_start >= end_pos) return false;
+    value_start += open_tag.size();
+    size_t value_end = src.find(close_tag, value_start);
+    if (value_end == std::string::npos || value_end > end_pos) return false;
+    out_value = src.substr(value_start, value_end - value_start);
+    return true;
+}
+
+/// Minimal XML parser for tileset XMLs used by C&C Remastered.
+static bool Parse_Tileset_XML(const char* xml, size_t len,
+                              std::unordered_map<uint32_t, TilesetEntry>& out)
+{
+    bool any_tiles = false;
     std::string s(xml, len);
+    std::string root_texture_path;
+    extract_tag_value(s, "RootTexturePath", 0, s.size(), root_texture_path);
+
     size_t pos = 0;
     while ((pos = s.find("<Tile>", pos)) != std::string::npos) {
         size_t end_pos = s.find("</Tile>", pos);
         if (end_pos == std::string::npos) break;
 
-        std::string tile = s.substr(pos, end_pos - pos);
-        
-        size_t name_start = tile.find("<Name>");
-        if (name_start != std::string::npos) {
-            name_start += 6;
-            size_t name_end = tile.find("</Name>", name_start);
-            if (name_end != std::string::npos) {
-                std::string name = tile.substr(name_start, name_end - name_start);
-                
-                int frames = 0;
-                size_t fpos = tile.find("<Frames>");
-                if (fpos != std::string::npos) {
-                    size_t fend = tile.find("</Frames>", fpos);
-                    while ((fpos = tile.find("<Frame>", fpos)) != std::string::npos && fpos < fend) {
-                        frames++;
-                        fpos += 7;
-                    }
-                }
-                
-                uint32_t name_hash = fnv1a_hash(name.c_str());
-                current_pass_frames[name_hash] += frames;
-                
-                auto& entry = out[name_hash];
-                if (entry.name.empty()) {
-                    entry.name_hash = name_hash;
-                    entry.name = name;
-                    entry.filename_pattern = name;
-                }
-            }
+        std::string name;
+        std::string shape_text;
+        if (!extract_tag_value(s, "Name", pos, end_pos, name) ||
+            !extract_tag_value(s, "Shape", pos, end_pos, shape_text)) {
+            pos = end_pos + 7;
+            continue;
         }
+
+        int shape_index = atoi(shape_text.c_str());
+        if (shape_index < 0) {
+            pos = end_pos + 7;
+            continue;
+        }
+
+        uint32_t name_hash = fnv1a_hash(name.c_str());
+        TilesetEntry& entry = out[name_hash];
+        entry.name_hash = name_hash;
+        entry.name = name;
+        entry.filename_pattern = name;
+        entry.root_texture_path = root_texture_path;
+
+        size_t frame_pos = pos;
+        int frame_offset = 0;
+        while ((frame_pos = s.find("<Frame>", frame_pos)) != std::string::npos && frame_pos < end_pos) {
+            size_t value_start = frame_pos + strlen("<Frame>");
+            size_t value_end = s.find("</Frame>", value_start);
+            if (value_end == std::string::npos || value_end > end_pos) {
+                break;
+            }
+
+            std::string frame_file = s.substr(value_start, value_end - value_start);
+            int frame_index = shape_index + frame_offset;
+            if (static_cast<int>(entry.frame_files.size()) <= frame_index) {
+                entry.frame_files.resize(frame_index + 1);
+            }
+            entry.frame_files[frame_index] = frame_file;
+            entry.frame_count = static_cast<int>(entry.frame_files.size());
+            any_tiles = true;
+
+            frame_offset++;
+            frame_pos = value_end + strlen("</Frame>");
+        }
+
         pos = end_pos + 7;
     }
 
-    for (const auto& pair : current_pass_frames) {
-        out[pair.first].frame_count = pair.second;
-    }
-
-    return !current_pass_frames.empty();
+    return any_tiles;
 }
 
-static const char* extract_category(const char* xml_path) {
+const char* HDSpriteProvider::Debug_Extract_Category(const char* xml_path) {
     const char* start = strrchr(xml_path, '\\');
     if (!start) start = strrchr(xml_path, '/');
     start = start ? start + 1 : xml_path;
@@ -178,6 +209,8 @@ static const char* extract_category(const char* xml_path) {
     if (name.find("INFANTRY") != std::string::npos) return "INFANTRY";
     if (name.find("STRUCTURE") != std::string::npos) return "STRUCTURES";
     if (name.find("UNIT") != std::string::npos) return "UNITS";
+    if (name.find("OVERLAY") != std::string::npos) return "OVERLAY";
+    if (name.find("TERRAIN") != std::string::npos) return "TERRAIN";
     return nullptr; // Unrecognised
 }
 
@@ -189,7 +222,7 @@ static bool Parse_Tileset_From_Reader(HDSpriteProvider_Impl* impl, MegReader& me
     void* xml_data = meg.Read_Alloc(entry, &xml_size);
     if (!xml_data) return false;
 
-    const char* cat = extract_category(xml_path);
+    const char* cat = HDSpriteProvider::Debug_Extract_Category(xml_path);
     if (!cat) {
         free(xml_data);
         return false;
@@ -251,7 +284,7 @@ static bool load_zip_for_entity(HDSpriteProvider_Impl* impl, const std::string& 
             }
         }
     }
-    
+
     // Clear the null sentinel on failure so we can retry later if the category was corrected
     impl->zip_cache.erase(entity);
     return false;
@@ -310,7 +343,7 @@ static bool load_frame_from_zip(ZipCache& zc, const char* entity_name,
     out.origin_y = meta.crop_y;
     out.canvas_width = meta.canvas_width;
     out.canvas_height = meta.canvas_height;
-    out.native_scale = 4.0f;
+    out.native_scale = TD_REMASTER_NATIVE_SCALE;
     return true;
 }
 
@@ -338,7 +371,7 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
         frame_out.origin_y      = cf.origin_y;
         frame_out.canvas_width  = cf.canvas_width;
         frame_out.canvas_height = cf.canvas_height;
-        frame_out.native_scale  = cf.native_scale > 0.0f ? cf.native_scale : 4.0f;
+        frame_out.native_scale  = cf.native_scale > 0.0f ? cf.native_scale : TD_REMASTER_NATIVE_SCALE;
         frame_out.pixel_format  = SpritePixelFormat::RGBA_32BIT;
         return true;
     }
@@ -358,6 +391,68 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
 
     // Still out of bounds fallback check
     if (!loaded && frame >= ts.frame_count) return false;
+    if (!loaded && frame < static_cast<int>(ts.frame_files.size()) &&
+        !ts.root_texture_path.empty() && !ts.frame_files[frame].empty()) {
+        std::string rel_path = ts.frame_files[frame];
+        for (char& c : rel_path) {
+            if (c == '/') c = '\\';
+        }
+
+        std::string full_path = "DATA\\ART\\TEXTURES\\SRGB\\";
+        full_path += ts.root_texture_path;
+        full_path += "\\";
+        full_path += rel_path;
+
+        if (full_path.size() >= 4) {
+            size_t ext = full_path.rfind('.');
+            if (ext != std::string::npos) {
+                full_path.replace(ext, full_path.size() - ext, ".DDS");
+            }
+        }
+
+        const MegEntry* dds_entry = impl->meg.Find(full_path.c_str());
+        if (dds_entry) {
+            size_t dds_size = 0;
+            void* dds_data = impl->meg.Read_Alloc(dds_entry, &dds_size);
+            if (dds_data) {
+                int w = 0, h = 0;
+                uint8_t* pixels = DDS_Decode_RGBA(dds_data, dds_size, w, h);
+                free(dds_data);
+
+                if (pixels) {
+                    std::string meta_path = full_path;
+                    size_t ext = meta_path.rfind('.');
+                    if (ext != std::string::npos) {
+                        meta_path.replace(ext, meta_path.size() - ext, ".META");
+                    }
+
+                    SpriteMeta meta = {};
+                    meta.canvas_width = w;
+                    meta.canvas_height = h;
+                    const MegEntry* meta_entry = impl->meg.Find(meta_path.c_str());
+                    if (meta_entry) {
+                        size_t meta_size = 0;
+                        void* meta_data = impl->meg.Read_Alloc(meta_entry, &meta_size);
+                        if (meta_data) {
+                            Meta_Parse(meta_data, meta_size, meta);
+                            free(meta_data);
+                        }
+                    }
+
+                    cf.pixels = pixels;
+                    cf.width = w;
+                    cf.height = h;
+                    cf.origin_x = meta.crop_x;
+                    cf.origin_y = meta.crop_y;
+                    cf.canvas_width = meta.canvas_width;
+                    cf.canvas_height = meta.canvas_height;
+                    cf.native_scale = TD_REMASTER_NATIVE_SCALE;
+                    loaded = true;
+                }
+            }
+        }
+    }
+
     if (!loaded) {
         char dds_path[512];
         snprintf(dds_path, sizeof(dds_path), "%s-%04d.DDS", ts.filename_pattern.c_str(), frame);
@@ -394,7 +489,7 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
                     cf.origin_y = meta.crop_y;
                     cf.canvas_width = meta.canvas_width;
                     cf.canvas_height = meta.canvas_height;
-                    cf.native_scale = 4.0f;
+                    cf.native_scale = TD_REMASTER_NATIVE_SCALE;
                     loaded = true;
                 }
             }
@@ -415,7 +510,7 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
     frame_out.origin_y      = cf.origin_y;
     frame_out.canvas_width  = cf.canvas_width;
     frame_out.canvas_height = cf.canvas_height;
-    frame_out.native_scale  = cf.native_scale > 0.0f ? cf.native_scale : 4.0f;
+    frame_out.native_scale  = cf.native_scale > 0.0f ? cf.native_scale : TD_REMASTER_NATIVE_SCALE;
     frame_out.pixel_format  = SpritePixelFormat::RGBA_32BIT;
     return true;
 }

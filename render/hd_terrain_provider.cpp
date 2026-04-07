@@ -10,6 +10,8 @@
 #include <ctype.h>
 #include <cstdlib>
 
+static constexpr float TD_REMASTER_NATIVE_SCALE = 128.0f / 24.0f;
+
 static uint32_t fnv1a_hash(const char* str) {
     uint32_t hash = 0x811C9DC5;
     while (*str) {
@@ -172,6 +174,7 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     out.canvas_height = meta.canvas_height;
     out.pitch = w * 4;
     out.pixel_format = SpritePixelFormat::RGBA_32BIT;
+    out.native_scale = TD_REMASTER_NATIVE_SCALE;
 
     size_t alloc_size = w * h * 4;
     // Keep decoded tiles hot in memory until the LRU trims them.
@@ -191,4 +194,23 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     }
 
     return true;
+}
+
+bool HDTerrainProvider::Get_Tile_By_Hash(uint32_t name_hash, int frame, SpriteFrame& out) {
+    if (frame < 0 || name_hash == 0) return false;
+    uint64_t cache_key = ((uint64_t)name_hash << 32) | (uint32_t)frame;
+
+    auto cache_it = impl_->cache.find(cache_key);
+    if (cache_it != impl_->cache.end()) {
+        impl_->lru_list.erase(cache_it->second.lru_it);
+        impl_->lru_list.push_front(cache_key);
+        cache_it->second.lru_it = impl_->lru_list.begin();
+        out = cache_it->second.frame;
+        return true;
+    }
+
+    auto tile_it = impl_->tiles.find(name_hash);
+    if (tile_it == impl_->tiles.end()) return false;
+    // Delegate to Get_Tile using the stored name so the full decode path runs.
+    return Get_Tile(tile_it->second.name.c_str(), frame, out);
 }

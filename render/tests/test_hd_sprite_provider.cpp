@@ -30,6 +30,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+
+static constexpr float TD_REMASTER_NATIVE_SCALE = 128.0f / 24.0f;
 
 /* ─── Asset path helpers ───────────────────────────────────── */
 
@@ -71,6 +74,21 @@ static uint32_t entity_hash(const char* name) {
         h *= 0x01000193u;
     }
     return h;
+}
+
+static bool has_nonzero_alpha(const SpriteFrame& frame) {
+    if (!frame.pixels || frame.width <= 0 || frame.height <= 0) {
+        return false;
+    }
+
+    const uint8_t* pixels = static_cast<const uint8_t*>(frame.pixels);
+    const size_t pixel_count = static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        if (pixels[i * 4 + 3] != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ─── Unit tests (no real data needed) ──────────────────────── */
@@ -123,6 +141,12 @@ TEST(hd_provider_open_config_meg) {
     PASS();
 }
 
+TEST(hd_provider_category_detection_overlay_terrain) {
+    EXPECT_EQ(std::string(HDSpriteProvider::Debug_Extract_Category("DATA\\XML\\TILESETS\\TD_OVERLAY.XML")), "OVERLAY");
+    EXPECT_EQ(std::string(HDSpriteProvider::Debug_Extract_Category("DATA\\XML\\TILESETS\\TD_TERRAIN_DESERT.XML")), "TERRAIN");
+    PASS();
+}
+
 /*
  * Load_Tileset reads from the MEG opened by Open().
  * The tileset XML (DATA\XML\TILESETS\TD_UNITS.XML) is in CONFIG.MEG,
@@ -153,7 +177,7 @@ TEST(hd_provider_get_frame_known_unit) {
     EXPECT_GT(frame.height, 0);
     EXPECT_NOT_NULL(frame.pixels);
     EXPECT_GE(frame.canvas_width, frame.width);
-    EXPECT_EQ(frame.native_scale, 4.0f);
+    EXPECT_NEAR(frame.native_scale, TD_REMASTER_NATIVE_SCALE, 0.0001f);
     PASS();
 }
 
@@ -181,6 +205,27 @@ TEST(hd_provider_frame_count_known_unit) {
     /* HTNK.ZIP has 64 frames (128 files = 64 tga + 64 meta) */
     int count = provider.Get_Frame_Count((void*)(uintptr_t)htnk_hash);
     EXPECT_EQ(count, 64);
+    PASS();
+}
+
+TEST(hd_provider_get_frame_known_overlay_and_tree) {
+    HDSpriteProvider provider;
+    EXPECT_TRUE(provider.Open(remastered_textures_td_meg()));
+    EXPECT_TRUE(provider.Load_Tileset_From_Meg(remastered_config_meg(), "DATA\\XML\\TILESETS\\TD_TERRAIN_TEMPERATE.XML"));
+
+    SpriteFrame overlay = {};
+    EXPECT_TRUE(provider.Get_Frame((void*)(uintptr_t)entity_hash("TI1"), 0, overlay));
+    EXPECT_EQ((int)overlay.pixel_format, (int)SpritePixelFormat::RGBA_32BIT);
+    EXPECT_GT(overlay.width, 0);
+    EXPECT_GT(overlay.height, 0);
+    EXPECT_TRUE(has_nonzero_alpha(overlay));
+
+    SpriteFrame tree = {};
+    EXPECT_TRUE(provider.Get_Frame((void*)(uintptr_t)entity_hash("T01"), 0, tree));
+    EXPECT_EQ((int)tree.pixel_format, (int)SpritePixelFormat::RGBA_32BIT);
+    EXPECT_GT(tree.width, 0);
+    EXPECT_GT(tree.height, 0);
+    EXPECT_TRUE(has_nonzero_alpha(tree));
     PASS();
 }
 

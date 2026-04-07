@@ -109,8 +109,10 @@ static const char* batch_frag_src = R"(
             color.rgb = mix(color.rgb, vec3(1.0), 0.7);
             color.a *= v_opacity;
         } else if (v_effect > 1.5) {
-            color.rgb = vec3(0.0);
-            color.a *= v_opacity;
+            // Preserve edge antialiasing from the remastered alpha mask, but
+            // keep shadows visibly softer than a pure black silhouette.
+            color.rgb = mix(color.rgb, vec3(0.0), 0.7);
+            color.a *= v_opacity * 0.75;
         } else if (v_effect > 0.5) {
             color.a *= v_opacity;
         } else if (v_opacity > 0.0) {
@@ -256,13 +258,12 @@ void GLSpriteBatch::Flush()
     impl_->sprite_count = static_cast<int>(impl_->entries.size());
     if (impl_->entries.empty()) return;
 
-    // Sort by atlas page for batching
-    std::sort(impl_->entries.begin(), impl_->entries.end(),
-              [](const SpriteBatchEntry& a, const SpriteBatchEntry& b) {
-                  return a.region.atlas_id < b.region.atlas_id;
-              });
+    // DO NOT sort by atlas page — draw list order must be preserved for correct
+    // overlapping (e.g., tank body drawn before turret). Instead, we flush on
+    // page transitions, batching consecutive same-page sprites together.
 
-    // Count actual draw calls, including chunk splits when a page exceeds MAX_QUADS.
+    // Count draw calls: each contiguous run of same-page sprites is one draw,
+    // split further if exceeding MAX_QUADS.
     {
         size_t idx = 0;
         while (idx < impl_->entries.size()) {

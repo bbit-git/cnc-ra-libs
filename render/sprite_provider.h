@@ -31,7 +31,7 @@ struct SpriteFrame {
     int         origin_y;       // Anchor Y offset (from META crop or SHP header)
     int         canvas_width;   // Original canvas width (for positioning)
     int         canvas_height;  // Original canvas height (for positioning)
-    float       native_scale;   // Sprite pixels per legacy sprite pixel (1.0 for legacy, 4.0 for HD)
+    float       native_scale;   // Sprite pixels per legacy sprite pixel (1.0 for legacy, remaster-dependent for HD)
     SpritePixelFormat pixel_format;
 };
 

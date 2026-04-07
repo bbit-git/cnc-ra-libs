@@ -19,6 +19,12 @@ public:
      */
     bool Get_Tile(const char* name, int frame, SpriteFrame& out);
 
+    /**
+     * Same as Get_Tile but keyed by pre-computed FNV-1a hash of the tile name.
+     * Use when the name string is unavailable (e.g., recorded as a hash in StampCmd).
+     */
+    bool Get_Tile_By_Hash(uint32_t name_hash, int frame, SpriteFrame& out);
+
 private:
     HDTerrainProvider_Impl* impl_;
 };
