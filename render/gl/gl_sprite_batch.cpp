@@ -81,9 +81,6 @@ static const char* batch_frag_src = R"(
     void main() {
         vec4 color = texture2D(u_atlas, v_uv);
         if (color.a < 0.01) discard;
-        if (v_effect < 0.5 && v_opacity <= 0.0) {
-            color.a = 1.0;
-        }
 
         if (v_house_hue >= 0.0) {
             float max_ch = max(color.r, max(color.g, color.b));
@@ -109,10 +106,10 @@ static const char* batch_frag_src = R"(
             color.rgb = mix(color.rgb, vec3(1.0), 0.7);
             color.a *= v_opacity;
         } else if (v_effect > 1.5) {
-            // Preserve edge antialiasing from the remastered alpha mask, but
-            // keep shadows visibly softer than a pure black silhouette.
-            color.rgb = mix(color.rgb, vec3(0.0), 0.7);
-            color.a *= v_opacity * 0.75;
+            // Preserve HD antialiasing while keeping legacy-like shadows
+            // lighter than the current over-dark silhouette approximation.
+            color.rgb = mix(color.rgb, vec3(0.0), 0.5);
+            color.a *= v_opacity;
         } else if (v_effect > 0.5) {
             color.a *= v_opacity;
         } else if (v_opacity > 0.0) {
