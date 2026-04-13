@@ -24,8 +24,8 @@ static uint32_t fnv1a_hash(const char* str) {
 struct TerrainInfo {
     uint32_t name_hash;
     std::string name;
-    std::string filename_pattern;
     int frame_count;
+    std::unordered_map<int, std::string> dds_paths;   // frame → actual DDS path in MEG
 };
 
 struct CachedTerrain {
@@ -105,9 +105,9 @@ void HDTerrainProvider::Set_Theater(const char* theater) {
             if (ts.name.empty()) {
                 ts.name_hash = name_hash;
                 ts.name = name;
-                ts.filename_pattern = fname_s.substr(0, dash);
                 ts.frame_count = 0;
             }
+            ts.dds_paths[frame] = fname_s;
             if (frame >= ts.frame_count) {
                 ts.frame_count = frame + 1;
             }
@@ -134,10 +134,11 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     auto& ts = tile_it->second;
     if (frame >= ts.frame_count) return false;
 
-    char dds_path[512];
-    snprintf(dds_path, sizeof(dds_path), "%s-%04d.DDS", ts.filename_pattern.c_str(), frame);
+    auto path_it = ts.dds_paths.find(frame);
+    if (path_it == ts.dds_paths.end()) return false;
+    const std::string& dds_path = path_it->second;
 
-    const MegEntry* dds_entry = impl_->meg.Find(dds_path);
+    const MegEntry* dds_entry = impl_->meg.Find(dds_path.c_str());
     if (!dds_entry) return false;
 
     size_t dds_size = 0;
@@ -153,9 +154,11 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     meta.canvas_width = w;
     meta.canvas_height = h;
 
-    char meta_path[512];
-    snprintf(meta_path, sizeof(meta_path), "%s-%04d.META", ts.filename_pattern.c_str(), frame);
-    const MegEntry* meta_entry = impl_->meg.Find(meta_path);
+    // Derive META path from DDS path by replacing the extension.
+    std::string meta_path = dds_path;
+    size_t ext_pos = meta_path.rfind(".DDS");
+    if (ext_pos != std::string::npos) meta_path.replace(ext_pos, 4, ".META");
+    const MegEntry* meta_entry = impl_->meg.Find(meta_path.c_str());
     if (meta_entry) {
         size_t meta_size = 0;
         void* meta_data = impl_->meg.Read_Alloc(meta_entry, &meta_size);
