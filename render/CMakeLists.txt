@@ -17,6 +17,7 @@ add_library(render_core STATIC
     ${RENDER_DIR}/hd_sprite_provider.cpp
     ${RENDER_DIR}/hd_terrain_provider.cpp
     ${RENDER_DIR}/dds_reader.cpp
+    ${RENDER_DIR}/mtd_reader.cpp
     ${RENDER_DIR}/texture_atlas.cpp
     ${RENDER_DIR}/render_compositor.cpp
     ${RENDER_DIR}/zip_reader.cpp
