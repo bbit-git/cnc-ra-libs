@@ -64,6 +64,13 @@ public:
      */
     const MTDEntry* Find(const char* name) const;
 
+    /**
+     * Find a sprite by name and return its index.
+     * @param name  Sprite name (case-insensitive)
+     * @return Index (0 to Count()-1), or -1 if not found
+     */
+    int Find_Index(const char* name) const;
+
 private:
     struct Impl;
     Impl* impl_;

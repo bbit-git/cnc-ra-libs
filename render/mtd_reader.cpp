@@ -13,6 +13,8 @@
 #include <cstring>
 #include <cctype>
 #include <vector>
+#include <unordered_map>
+#include <string>
 
 static const uint32_t MTD_MAGIC = 0xFFFFFFFE;
 
@@ -23,14 +25,15 @@ static uint32_t read_u32(const uint8_t* p) {
          | ((uint32_t)p[3] << 24);
 }
 
-static bool iequal(const char* a, const char* b) {
-    while (*a && *b) {
-        if (toupper((unsigned char)*a) != toupper((unsigned char)*b))
-            return false;
-        a++;
-        b++;
-    }
-    return *a == *b;
+/// In-place uppercase into a static buffer to avoid per-call heap allocation.
+/// MTD sprite names are short (<64 chars), so a fixed buffer is safe.
+static const char* to_upper(const char* s) {
+    static char buf[128];
+    int i = 0;
+    for (; *s && i < 126; s++, i++)
+        buf[i] = static_cast<char>(toupper(static_cast<unsigned char>(*s)));
+    buf[i] = '\0';
+    return buf;
 }
 
 struct MTDReader::Impl {
@@ -38,6 +41,7 @@ struct MTDReader::Impl {
     size_t              data_size;
     uint32_t            bpp;
     std::vector<MTDEntry> entries;
+    std::unordered_map<std::string, int> name_to_index;  // uppercased name → index
 };
 
 MTDReader::MTDReader() : impl_(nullptr) {}
@@ -125,7 +129,9 @@ bool MTDReader::Open(const void* data, size_t size) {
             ptr += 4;  // skip next_name_size
         }
 
+        int idx = static_cast<int>(imp->entries.size());
         imp->entries.push_back(entry);
+        imp->name_to_index[to_upper(entry.name)] = idx;
     }
 
     impl_ = imp;
@@ -159,12 +165,17 @@ const MTDEntry* MTDReader::Get_Entry(int index) const {
     return &impl_->entries[index];
 }
 
-const MTDEntry* MTDReader::Find(const char* name) const {
+int MTDReader::Find_Index(const char* name) const {
     if (!impl_ || !name)
-        return nullptr;
-    for (const auto& e : impl_->entries) {
-        if (iequal(e.name, name))
-            return &e;
-    }
-    return nullptr;
+        return -1;
+    auto it = impl_->name_to_index.find(to_upper(name));
+    if (it == impl_->name_to_index.end())
+        return -1;
+    return it->second;
+}
+
+const MTDEntry* MTDReader::Find(const char* name) const {
+    int idx = Find_Index(name);
+    if (idx < 0) return nullptr;
+    return &impl_->entries[idx];
 }
