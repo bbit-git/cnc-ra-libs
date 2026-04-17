@@ -37,6 +37,11 @@ uint32_t Bink2Header::Declared_File_Size() const
     return file_size_minus_8 + 8u;
 }
 
+bool Bink2Header::Has_Alpha() const
+{
+    return (video_flags & 0x00100000u) != 0;
+}
+
 bool Bink2PacketHeader::Has_Row_Block_Flags() const
 {
     return (frame_flags & 0x8000u) != 0;

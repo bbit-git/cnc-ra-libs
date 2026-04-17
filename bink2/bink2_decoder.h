@@ -34,6 +34,7 @@ struct Bink2Header {
     bool     Is_Valid() const;
     char     Revision() const;
     uint32_t Declared_File_Size() const;
+    bool     Has_Alpha() const;
 };
 
 struct Bink2FrameIndexEntry {
