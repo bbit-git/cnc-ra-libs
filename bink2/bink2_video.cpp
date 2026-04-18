@@ -1751,7 +1751,16 @@ bool Bink2PrepareFramePlan(const Bink2Header& header,
     plan.aligned_width = Align32(header.width);
     plan.aligned_height = Align32(header.height);
     plan.row_flag_count = (Align16(header.height) >> 3) - 1u;
-    plan.col_flag_count = (Align16(header.width) >> 3) - 1u;
+    // RAD bink2 col_flags: one flag per 8-pixel column boundary within the
+    // frame. For widths that are 32-aligned (704, 1920, 960, 1280, 3840, …),
+    // the rightmost boundary is the MB edge itself and is omitted → `- 1`.
+    // For widths that are 16-aligned but not 32-aligned (e.g. 720 → 22.5 MB
+    // cols), the half-MB right edge contributes one additional col_flag.
+    // Observed on TANKGO.BK2 (720×396, frame_flags=0x00072018): with the
+    // minus-1 form slice 0 decodes garbage because flag-stream bit
+    // consumption short-reads by 1. Verified against BP64 x11grab capture.
+    plan.col_flag_count = (Align16(header.width) >> 3) -
+                          ((header.width & 31u) == 0u ? 1u : 0u);
     plan.has_global_block_flags = (packet_header.frame_flags & 0x10000u) != 0;
     plan.has_row_flag_stream = plan.has_global_block_flags && !packet_header.Has_Row_Block_Flags();
     plan.has_col_flag_stream = plan.has_global_block_flags && !packet_header.Has_Column_Block_Flags();
@@ -1760,7 +1769,6 @@ bool Bink2PrepareFramePlan(const Bink2Header& header,
         !DecodeFlagStream(bits, 1u, plan.row_flag_count, plan.row_flags)) {
         return false;
     }
-
     if (plan.has_col_flag_stream &&
         !DecodeFlagStream(bits, 1u, plan.col_flag_count, plan.col_flags)) {
         return false;
