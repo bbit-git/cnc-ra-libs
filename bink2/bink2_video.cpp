@@ -1750,17 +1750,15 @@ bool Bink2PrepareFramePlan(const Bink2Header& header,
     plan.packet = packet_header;
     plan.aligned_width = Align32(header.width);
     plan.aligned_height = Align32(header.height);
+    // RAD bink2 flag counts: one flag per 8-pixel boundary within the
+    // 32-aligned luma grid, minus the rightmost/bottommost boundary that
+    // coincides with the MB edge. Columns use Align32 (a half-MB right
+    // edge e.g. width=720 still contributes its column boundaries up to
+    // MB edge 736). Rows use Align16 — empirically verified against BP64
+    // on BLACKOUT (720×396, Align32=416): stream length matches
+    // (Align16(h)>>3)-1 = 49, not (Align32(h)>>3)-1 = 51.
     plan.row_flag_count = (Align16(header.height) >> 3) - 1u;
-    // RAD bink2 col_flags: one flag per 8-pixel column boundary within the
-    // frame. For widths that are 32-aligned (704, 1920, 960, 1280, 3840, …),
-    // the rightmost boundary is the MB edge itself and is omitted → `- 1`.
-    // For widths that are 16-aligned but not 32-aligned (e.g. 720 → 22.5 MB
-    // cols), the half-MB right edge contributes one additional col_flag.
-    // Observed on TANKGO.BK2 (720×396, frame_flags=0x00072018): with the
-    // minus-1 form slice 0 decodes garbage because flag-stream bit
-    // consumption short-reads by 1. Verified against BP64 x11grab capture.
-    plan.col_flag_count = (Align16(header.width) >> 3) -
-                          ((header.width & 31u) == 0u ? 1u : 0u);
+    plan.col_flag_count = (Align32(header.width) >> 3) - 1u;
     plan.has_global_block_flags = (packet_header.frame_flags & 0x10000u) != 0;
     plan.has_row_flag_stream = plan.has_global_block_flags && !packet_header.Has_Row_Block_Flags();
     plan.has_col_flag_stream = plan.has_global_block_flags && !packet_header.Has_Column_Block_Flags();
