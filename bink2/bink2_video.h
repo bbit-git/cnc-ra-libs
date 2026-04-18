@@ -155,6 +155,67 @@ struct Bink2DecodedFrame {
     std::vector<uint8_t> a;
 };
 
+struct Bink2MacroblockBitBudget {
+    uint32_t mb_col = 0;
+    uint32_t mb_row = 0;
+    uint32_t flags = 0;
+    int32_t  intra_q = 0;
+    bool     has_alpha = false;
+    uint32_t y_cbp = 0;
+    uint32_t u_cbp = 0;
+    uint32_t v_cbp = 0;
+    uint32_t a_cbp = 0;
+
+    size_t   bit_offset_before = 0;
+    size_t   bit_offset_after = 0;
+    size_t   bits_total = 0;
+
+    size_t   bits_dq = 0;
+    size_t   bits_y_cbp = 0;
+    size_t   bits_y_dc = 0;
+    size_t   bits_u_cbp = 0;
+    size_t   bits_u_dc = 0;
+    size_t   bits_v_cbp = 0;
+    size_t   bits_v_dc = 0;
+    size_t   bits_a_cbp = 0;
+    size_t   bits_a_dc = 0;
+
+    std::array<size_t, 16> bits_y_ac = {};
+    std::array<size_t, 4>  bits_u_ac = {};
+    std::array<size_t, 4>  bits_v_ac = {};
+    std::array<size_t, 16> bits_a_ac = {};
+    size_t   bits_y_ac_total = 0;
+    size_t   bits_u_ac_total = 0;
+    size_t   bits_v_ac_total = 0;
+    size_t   bits_a_ac_total = 0;
+};
+
+struct Bink2DcDeltaTraceEntry {
+    uint32_t index = 0;
+    size_t   bit_offset_start = 0;
+    uint32_t unary = 0;
+    size_t   bit_offset_after_unary = 0;
+    bool     has_extra = false;
+    uint32_t extra_bits = 0;
+    uint32_t extra_value = 0;
+    size_t   bit_offset_after_extra = 0;
+    bool     has_sign = false;
+    uint32_t sign_bit = 0;
+    size_t   bit_offset_after_sign = 0;
+    int32_t  delta = 0;
+    int32_t  tdc = 0;
+};
+
+struct Bink2DcDeltaTrace {
+    int32_t intra_q = 0;
+    int32_t pat = 0;
+    bool    has_delta_bit_present = false;
+    uint32_t has_delta_value = 0;
+    size_t  bit_offset_begin = 0;
+    size_t  bit_offset_end = 0;
+    std::vector<Bink2DcDeltaTraceEntry> entries;
+};
+
 struct Bink2KeyframeMacroblockTraceEntry {
     Bink2IntraMacroblockProbe probe = {};
     size_t                    bits_used = 0;
@@ -190,6 +251,40 @@ bool Bink2DecodeFirstKeyframeFramePrefix(const Bink2Header& header,
                                          const Bink2FramePlan& plan,
                                          const std::vector<uint8_t>& packet,
                                          Bink2DecodedFrame& frame);
+
+// Walks an inter-frame packet decoding only SKIP blocks (copies from previous
+// frame). Stops at the first non-SKIP block and reports how many SKIPs were
+// decoded. Produces a partial frame buffer; non-decoded MBs are left neutral.
+// Returns true if at least the bitstream positioning succeeded.
+bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
+                                     const Bink2FramePlan& plan,
+                                     const std::vector<uint8_t>& packet,
+                                     const Bink2DecodedFrame& prev_frame,
+                                     Bink2DecodedFrame& frame);
+
+bool Bink2ProbeMacroblockBitBudget(const Bink2Header& header,
+                                   const Bink2FramePlan& plan,
+                                   const std::vector<uint8_t>& packet,
+                                   uint32_t target_mb_col,
+                                   uint32_t target_mb_row,
+                                   Bink2MacroblockBitBudget& budget);
+
+bool Bink2ProbeMacroblockBitBudgetInterleaved(const Bink2Header& header,
+                                              const Bink2FramePlan& plan,
+                                              const std::vector<uint8_t>& packet,
+                                              uint32_t target_mb_col,
+                                              uint32_t target_mb_row,
+                                              Bink2MacroblockBitBudget& budget);
+
+bool Bink2TraceDcDeltasForMacroblock(const Bink2Header& header,
+                                     const Bink2FramePlan& plan,
+                                     const std::vector<uint8_t>& packet,
+                                     uint32_t target_mb_col,
+                                     uint32_t target_mb_row,
+                                     Bink2DcDeltaTrace& y_trace,
+                                     Bink2DcDeltaTrace& u_trace,
+                                     Bink2DcDeltaTrace& v_trace,
+                                     Bink2DcDeltaTrace& a_trace);
 
 bool Bink2TraceFirstKeyframeSlicePrefix(const Bink2Header& header,
                                         const Bink2FramePlan& plan,

@@ -76,7 +76,37 @@ bool Bink2Decoder::Open(const char* path)
         return false;
     }
 
-    if (header_.audio_track_count == 0 && !Parse_Video_Only_Index()) {
+    uint32_t audio_bytes = 0;
+    if (header_.audio_track_count > 0 && !Parse_Audio_Tracks(audio_bytes)) {
+        Close();
+        return false;
+    }
+    if (!Parse_Frame_Index(kBink2HeaderSize + audio_bytes)) {
+        Close();
+        return false;
+    }
+
+    return true;
+}
+
+bool Bink2Decoder::Open_Memory(const uint8_t* data, size_t size)
+{
+    Close();
+    if (!data || size < kBink2HeaderSize) return false;
+
+    mem_.assign(data, data + size);
+
+    if (!Parse_Header()) {
+        Close();
+        return false;
+    }
+
+    uint32_t audio_bytes = 0;
+    if (header_.audio_track_count > 0 && !Parse_Audio_Tracks(audio_bytes)) {
+        Close();
+        return false;
+    }
+    if (!Parse_Frame_Index(kBink2HeaderSize + audio_bytes)) {
         Close();
         return false;
     }
@@ -91,17 +121,27 @@ void Bink2Decoder::Close()
         fp_ = nullptr;
     }
     header_ = {};
+    audio_tracks_.clear();
     frame_index_.clear();
+    mem_.clear();
+    mem_.shrink_to_fit();
 }
 
 bool Bink2Decoder::Is_Open() const
 {
-    return fp_ != nullptr;
+    return fp_ != nullptr || !mem_.empty();
 }
 
 bool Bink2Decoder::Supports_Video_Only() const
 {
-    return Is_Open() && header_.audio_track_count == 0 && frame_index_.size() == (size_t)header_.frame_count + 1;
+    return Is_Open() &&
+           header_.audio_track_count == 0 &&
+           frame_index_.size() == (size_t)header_.frame_count + 1;
+}
+
+const std::vector<Bink2AudioTrack>& Bink2Decoder::Audio_Tracks() const
+{
+    return audio_tracks_;
 }
 
 const Bink2Header& Bink2Decoder::Header() const
@@ -120,11 +160,12 @@ const Bink2FrameIndexEntry* Bink2Decoder::Frame_Entry(size_t index) const
     return &frame_index_[index];
 }
 
-bool Bink2Decoder::Read_Video_Packet(size_t frame_index, std::vector<uint8_t>& packet) const
+bool Bink2Decoder::Read_Frame_Packet(size_t frame_index, std::vector<uint8_t>& packet) const
 {
     packet.clear();
 
-    if (!Supports_Video_Only()) return false;
+    if (!Is_Open()) return false;
+    if (frame_index + 1 >= frame_index_.size()) return false;
     if (frame_index >= (size_t)header_.frame_count) return false;
 
     uint32_t start = frame_index_[frame_index].file_offset;
@@ -139,6 +180,59 @@ bool Bink2Decoder::Read_Video_Packet(size_t frame_index, std::vector<uint8_t>& p
     }
 
     return true;
+}
+
+bool Bink2Decoder::Read_Video_Packet(size_t frame_index, std::vector<uint8_t>& packet) const
+{
+    std::vector<uint8_t> raw;
+    if (!Read_Frame_Packet(frame_index, raw)) return false;
+
+    if (header_.audio_track_count == 0) {
+        packet = std::move(raw);
+        return true;
+    }
+
+    // Audio-bearing layout: the packet starts with N audio sub-packets, each
+    // prefixed by a u32 audio_size, followed by the video payload.
+    size_t off = 0;
+    for (uint32_t i = 0; i < header_.audio_track_count; ++i) {
+        if (off + 4 > raw.size()) return false;
+        uint32_t audio_size = Read_LE32(raw.data() + off);
+        off += 4;
+        if (audio_size > raw.size() - off) return false;
+        off += audio_size;
+    }
+
+    packet.assign(raw.begin() + (std::ptrdiff_t)off, raw.end());
+    return true;
+}
+
+bool Bink2Decoder::Read_Audio_Packet(size_t frame_index,
+                                     uint32_t track_index,
+                                     std::vector<uint8_t>& packet) const
+{
+    packet.clear();
+
+    if (track_index >= header_.audio_track_count) return false;
+
+    std::vector<uint8_t> raw;
+    if (!Read_Frame_Packet(frame_index, raw)) return false;
+
+    size_t off = 0;
+    for (uint32_t i = 0; i < header_.audio_track_count; ++i) {
+        if (off + 4 > raw.size()) return false;
+        uint32_t audio_size = Read_LE32(raw.data() + off);
+        off += 4;
+        if (audio_size > raw.size() - off) return false;
+        if (i == track_index) {
+            packet.assign(raw.begin() + (std::ptrdiff_t)off,
+                          raw.begin() + (std::ptrdiff_t)(off + audio_size));
+            return true;
+        }
+        off += audio_size;
+    }
+
+    return false;
 }
 
 bool Bink2Decoder::Parse_Packet_Header(const std::vector<uint8_t>& packet,
@@ -218,13 +312,44 @@ bool Bink2Decoder::Parse_Header()
     return header_.Is_Valid();
 }
 
-bool Bink2Decoder::Parse_Video_Only_Index()
+bool Bink2Decoder::Parse_Audio_Tracks(uint32_t& audio_bytes_consumed)
+{
+    audio_tracks_.clear();
+    audio_bytes_consumed = 0;
+
+    const uint32_t n = header_.audio_track_count;
+    if (n == 0) return true;
+
+    // Layout: n * u32 max_decoded_size, n * (u16 sample_rate + u16 flags),
+    // n * u32 track_id. Total = 3 * n * 4 bytes.
+    const uint32_t bytes = n * 12u;
+    std::vector<uint8_t> raw(bytes);
+    if (!Read_At(kBink2HeaderSize, raw.data(), raw.size())) return false;
+
+    audio_tracks_.resize(n);
+    const uint8_t* max_sizes = raw.data();
+    const uint8_t* fmts      = raw.data() + n * 4u;
+    const uint8_t* ids       = raw.data() + n * 8u;
+    for (uint32_t i = 0; i < n; ++i) {
+        audio_tracks_[i].max_decoded_size = Read_LE32(max_sizes + i * 4u);
+        audio_tracks_[i].sample_rate      = Read_LE16(fmts + i * 4u);
+        audio_tracks_[i].flags            = Read_LE16(fmts + i * 4u + 2u);
+        audio_tracks_[i].id               = Read_LE32(ids + i * 4u);
+    }
+
+    audio_bytes_consumed = bytes;
+    return true;
+}
+
+bool Bink2Decoder::Parse_Frame_Index(uint32_t header_and_audio_size)
 {
     frame_index_.clear();
 
     const size_t count = (size_t)header_.frame_count + 1;
     std::vector<uint8_t> raw(count * sizeof(uint32_t));
-    if (!Read_At(kBink2HeaderSize, raw.data(), raw.size())) return false;
+    if (!Read_At(header_and_audio_size, raw.data(), raw.size())) return false;
+
+    const uint32_t min_offset = header_and_audio_size + (uint32_t)raw.size();
 
     frame_index_.resize(count);
     uint32_t prev = 0;
@@ -233,7 +358,7 @@ bool Bink2Decoder::Parse_Video_Only_Index()
         uint32_t offset = value & ~1u;
         bool keyframe = (value & 1u) != 0;
 
-        if (offset < kBink2HeaderSize + raw.size()) return false;
+        if (offset < min_offset) return false;
         if (offset > header_.Declared_File_Size()) return false;
         if (i > 0 && offset < prev) return false;
 
@@ -248,14 +373,20 @@ bool Bink2Decoder::Parse_Video_Only_Index()
 
 bool Bink2Decoder::Read_At(uint32_t offset, void* buffer, size_t size) const
 {
-    if (!fp_ || !buffer) return false;
+    if (!buffer) return false;
+    if (!mem_.empty()) {
+        if ((size_t)offset + size > mem_.size()) return false;
+        std::memcpy(buffer, mem_.data() + offset, size);
+        return true;
+    }
+    if (!fp_) return false;
     if (std::fseek(fp_, (long)offset, SEEK_SET) != 0) return false;
     return std::fread(buffer, 1, size, fp_) == size;
 }
 
 uint32_t Bink2Decoder::Frame_End_Offset(size_t frame_index) const
 {
-    if (!Supports_Video_Only()) return 0;
+    if (!Is_Open()) return 0;
     if (frame_index + 1 >= frame_index_.size()) return header_.Declared_File_Size();
     return frame_index_[frame_index + 1].file_offset;
 }
@@ -266,6 +397,11 @@ uint32_t Bink2Decoder::Read_LE32(const uint8_t* data)
            ((uint32_t)data[1] << 8) |
            ((uint32_t)data[2] << 16) |
            ((uint32_t)data[3] << 24);
+}
+
+uint16_t Bink2Decoder::Read_LE16(const uint8_t* data)
+{
+    return (uint16_t)(((uint16_t)data[0]) | ((uint16_t)data[1] << 8));
 }
 
 uint32_t Bink2Decoder::Align32(uint32_t value)

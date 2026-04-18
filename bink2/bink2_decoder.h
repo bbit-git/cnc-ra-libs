@@ -43,6 +43,17 @@ struct Bink2FrameIndexEntry {
     bool     keyframe = false;
 };
 
+struct Bink2AudioTrack {
+    uint32_t max_decoded_size = 0;  // from per-track u32 table
+    uint16_t sample_rate      = 0;  // Hz
+    uint16_t flags            = 0;  // BINK_AUD_* (DCT / STEREO / 16bits)
+    uint32_t id               = 0;  // per-track u32 id
+
+    bool Use_DCT() const  { return (flags & 0x1000u) != 0; }
+    bool Stereo() const   { return (flags & 0x2000u) != 0; }
+    bool Prefer16() const { return (flags & 0x4000u) != 0; }
+};
+
 struct Bink2PacketHeader {
     uint32_t frame_flags = 0;
     uint32_t num_slices = 0;
@@ -59,30 +70,56 @@ public:
     ~Bink2Decoder();
 
     bool Open(const char* path);
+    // Memory-backed open. The decoder takes a copy of `data` so the caller
+    // is free to free its buffer after the call returns.
+    bool Open_Memory(const uint8_t* data, size_t size);
     void Close();
 
     bool Is_Open() const;
-    bool Supports_Video_Only() const;
+    bool Supports_Video_Only() const;  // true iff audio_track_count == 0
 
     const Bink2Header& Header() const;
     size_t Frame_Index_Count() const;
     const Bink2FrameIndexEntry* Frame_Entry(size_t index) const;
 
+    // Audio tracks parsed from the container (empty for silent files).
+    const std::vector<Bink2AudioTrack>& Audio_Tracks() const;
+
+    // Reads the raw frame packet (audio-bearing files: includes per-track
+    // audio sub-packets at the start, followed by the video payload).
+    bool Read_Frame_Packet(size_t frame_index, std::vector<uint8_t>& packet) const;
+
+    // Returns the video-only payload for a frame, stripping the per-track
+    // `u32 audio_size + audio_bytes` prefixes present in audio-bearing
+    // files. Works transparently for silent files too.
     bool Read_Video_Packet(size_t frame_index, std::vector<uint8_t>& packet) const;
+
+    // Returns the audio sub-packet for (frame, track) from an audio-bearing
+    // file. Returns an empty `packet` (and `true`) when the track has no
+    // data in this frame (audio_size == 0). Returns `false` on out-of-range
+    // indices or malformed packet layout.
+    bool Read_Audio_Packet(size_t frame_index,
+                           uint32_t track_index,
+                           std::vector<uint8_t>& packet) const;
+
     bool Parse_Packet_Header(const std::vector<uint8_t>& packet, Bink2PacketHeader& header) const;
 
 private:
     bool Parse_Header();
-    bool Parse_Video_Only_Index();
+    bool Parse_Audio_Tracks(uint32_t& audio_bytes_consumed);
+    bool Parse_Frame_Index(uint32_t header_and_audio_size);
     bool Read_At(uint32_t offset, void* buffer, size_t size) const;
     uint32_t Frame_End_Offset(size_t frame_index) const;
 
     static uint32_t Read_LE32(const uint8_t* data);
+    static uint16_t Read_LE16(const uint8_t* data);
     static uint32_t Align32(uint32_t value);
 
 private:
-    std::FILE*                    fp_;
-    Bink2Header                   header_;
+    std::FILE*                        fp_;
+    std::vector<uint8_t>              mem_;   // non-empty when backed by a memory buffer
+    Bink2Header                       header_;
+    std::vector<Bink2AudioTrack>      audio_tracks_;
     std::vector<Bink2FrameIndexEntry> frame_index_;
 };
 
