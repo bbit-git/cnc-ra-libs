@@ -2116,15 +2116,113 @@ static inline int32_t QuarterPelAvg(int sum) {
     if (mode == 2) return (sum + 3 + ((sum >> 3) & 1)) >> 3;
     return (sum + 4) >> 3;
 }
+// MC sum-parity histogram. Populated by ChH/ChV when BK2_REPORT_MC_PARITY=1
+// is set; dumped by the dtor below. The quarter-pel sum 6a+2b is always
+// even, so only buckets {0,2,4,6} see non-zero counts — residents of
+// bucket 4 are the half-even tie-breaks (they are the only pixels whose
+// result depends on the rounding rule). A skewed distribution in bucket
+// counts between samples is the mechanism that makes h0q2 residual-drift
+// asymmetric across content (explains why AFRICA stays byte-identical
+// while GDI13 drifts green with the same filter).
+struct Bink2McParityCounters {
+    uint64_t q_sum_hist[8]{};       // 6a+2b (or 2a+6b) mod 8
+    uint64_t q_sum_hist_leading[8]{}; // 6a+2b (a-weighted, n=1 direction)
+    uint64_t q_sum_hist_trailing[8]{}; // 2a+6b (b-weighted, n=3 direction)
+    uint64_t hp_sum_parity[2]{};    // (a+b) & 1
+    uint64_t quarterpel_calls = 0;
+    uint64_t halfpel_calls = 0;
+    ~Bink2McParityCounters() {
+        if (const char* e = std::getenv("BK2_REPORT_MC_PARITY");
+            !(e && e[0] && e[0] != '0')) return;
+        if (!quarterpel_calls && !halfpel_calls) return;
+        std::fprintf(stderr,
+            "[BK2 mc parity] quarterpel_calls=%llu halfpel_calls=%llu\n",
+            (unsigned long long)quarterpel_calls,
+            (unsigned long long)halfpel_calls);
+        const double q = quarterpel_calls ? (double)quarterpel_calls : 1.0;
+        std::fprintf(stderr, "  quarterpel (6a+2b or 2a+6b) mod 8 histogram:\n");
+        for (int k = 0; k < 8; ++k) {
+            std::fprintf(stderr, "    mod=%d  count=%12llu  frac=%.4f\n",
+                k, (unsigned long long)q_sum_hist[k],
+                (double)q_sum_hist[k] / q);
+        }
+        std::fprintf(stderr, "  leading-direction (n=1, 6a+2b) mod 8:\n");
+        for (int k = 0; k < 8; ++k) {
+            if (q_sum_hist_leading[k])
+                std::fprintf(stderr, "    mod=%d  count=%12llu\n",
+                    k, (unsigned long long)q_sum_hist_leading[k]);
+        }
+        std::fprintf(stderr, "  trailing-direction (n=3, 2a+6b) mod 8:\n");
+        for (int k = 0; k < 8; ++k) {
+            if (q_sum_hist_trailing[k])
+                std::fprintf(stderr, "    mod=%d  count=%12llu\n",
+                    k, (unsigned long long)q_sum_hist_trailing[k]);
+        }
+        if (halfpel_calls) {
+            std::fprintf(stderr, "  halfpel (a+b) parity: even=%llu odd=%llu frac_odd=%.4f\n",
+                (unsigned long long)hp_sum_parity[0],
+                (unsigned long long)hp_sum_parity[1],
+                (double)hp_sum_parity[1] / (double)halfpel_calls);
+        }
+    }
+};
+static Bink2McParityCounters g_mc_parity;
+static inline bool Bk2McParityEnabled() {
+    static const bool on = []{
+        const char* e = std::getenv("BK2_REPORT_MC_PARITY");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
 static inline int32_t ChH(int n, const uint8_t* s, int i) {
-    if (n == 1) return QuarterPelAvg(6*s[i+0] + 2*s[i+1]);
-    if (n == 2) return HalfPelAvg(s[i+0], s[i+1]);
-    return              QuarterPelAvg(2*s[i+0] + 6*s[i+1]);
+    if (n == 1) {
+        const int sum = 6*s[i+0] + 2*s[i+1];
+        if (Bk2McParityEnabled()) {
+            ++g_mc_parity.quarterpel_calls;
+            ++g_mc_parity.q_sum_hist[sum & 7];
+            ++g_mc_parity.q_sum_hist_leading[sum & 7];
+        }
+        return QuarterPelAvg(sum);
+    }
+    if (n == 2) {
+        if (Bk2McParityEnabled()) {
+            ++g_mc_parity.halfpel_calls;
+            ++g_mc_parity.hp_sum_parity[(s[i+0] + s[i+1]) & 1];
+        }
+        return HalfPelAvg(s[i+0], s[i+1]);
+    }
+    const int sum = 2*s[i+0] + 6*s[i+1];
+    if (Bk2McParityEnabled()) {
+        ++g_mc_parity.quarterpel_calls;
+        ++g_mc_parity.q_sum_hist[sum & 7];
+        ++g_mc_parity.q_sum_hist_trailing[sum & 7];
+    }
+    return QuarterPelAvg(sum);
 }
 static inline int32_t ChV(int n, const uint8_t* s, int stride) {
-    if (n == 1) return QuarterPelAvg(6*s[0] + 2*s[stride]);
-    if (n == 2) return HalfPelAvg(s[0], s[stride]);
-    return              QuarterPelAvg(2*s[0] + 6*s[stride]);
+    if (n == 1) {
+        const int sum = 6*s[0] + 2*s[stride];
+        if (Bk2McParityEnabled()) {
+            ++g_mc_parity.quarterpel_calls;
+            ++g_mc_parity.q_sum_hist[sum & 7];
+            ++g_mc_parity.q_sum_hist_leading[sum & 7];
+        }
+        return QuarterPelAvg(sum);
+    }
+    if (n == 2) {
+        if (Bk2McParityEnabled()) {
+            ++g_mc_parity.halfpel_calls;
+            ++g_mc_parity.hp_sum_parity[(s[0] + s[stride]) & 1];
+        }
+        return HalfPelAvg(s[0], s[stride]);
+    }
+    const int sum = 2*s[0] + 6*s[stride];
+    if (Bk2McParityEnabled()) {
+        ++g_mc_parity.quarterpel_calls;
+        ++g_mc_parity.q_sum_hist[sum & 7];
+        ++g_mc_parity.q_sum_hist_trailing[sum & 7];
+    }
+    return QuarterPelAvg(sum);
 }
 static inline uint8_t Clip255(int32_t v) {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
@@ -2263,11 +2361,30 @@ static void LumaMcMacroblock(const Bink2MvBlock& mv,
 // when Bink2gIdctAdd is called via the chroma residual path (see
 // DecodeAndAddInterChromaPlane). Snapshot+reset around the per-frame outer
 // decode and print at process exit.
+//
+// `by_dc` buckets per-pixel residuals by |DC| of the originating 8x8 block:
+// 0 = DC==0, 1 = 1..31, 2 = 32..127, 3 = 128..511, 4 = 512+.
+// `by_ac` buckets by max |AC| of the block (AC = all block[] except [0]):
+// 0 = max==0, 1 = 1..15, 2 = 16..63, 3 = 64..255, 4 = 256+.
+// `by_q` buckets by the block's inter q: 0..9, 10..19, 20..29, 30..36.
+struct Bink2ChromaSatBucket {
+    uint64_t pixels = 0;
+    int64_t  sum = 0;
+};
 struct Bink2ChromaSatCounters {
     uint64_t low = 0;   // pixels clamped at 0 (sum < 0)
     uint64_t high = 0;  // pixels clamped at 255 (sum > 255)
     uint64_t pixels = 0; // total pixels seen
     int64_t  sum_residual = 0; // signed sum of all chroma IDCT residuals
+    Bink2ChromaSatBucket by_dc[5];
+    Bink2ChromaSatBucket by_ac[5];
+    Bink2ChromaSatBucket by_q[4];
+    // Decoded-DC aggregates (pre-IDCT, pre-bias): helps decide whether the
+    // residual green bias comes from the IDCT path (mean_dc==0) or from
+    // biased DC decode (mean_dc!=0).
+    uint64_t dc_blocks = 0;
+    int64_t  sum_dc = 0;    // signed sum of raw dc[j] values
+    int64_t  sum_abs_dc = 0; // sum of |dc[j]|
     ~Bink2ChromaSatCounters() {
         if (const char* e = std::getenv("BK2_REPORT_CHROMA_SAT");
             e && e[0] && e[0] != '0' && pixels) {
@@ -2279,10 +2396,56 @@ struct Bink2ChromaSatCounters {
                 (long long)((int64_t)high - (int64_t)low),
                 (long long)sum_residual,
                 (double)sum_residual / (double)pixels);
+            static const char* dc_names[5] = {"DC=0    ", "DC=1-31 ", "DC=32-127", "DC=128-511", "DC=512+  "};
+            static const char* ac_names[5] = {"|AC|=0   ", "|AC|=1-15", "|AC|=16-63", "|AC|=64-255", "|AC|=256+ "};
+            static const char* q_names[4] = {"q=0-9  ", "q=10-19", "q=20-29", "q=30-36"};
+            for (int i = 0; i < 5; ++i) {
+                const double m = by_dc[i].pixels ? (double)by_dc[i].sum / (double)by_dc[i].pixels : 0.0;
+                std::fprintf(stderr, "  %s  pixels=%10llu  mean=%+.4f  sum=%+lld\n",
+                    dc_names[i], (unsigned long long)by_dc[i].pixels, m, (long long)by_dc[i].sum);
+            }
+            for (int i = 0; i < 5; ++i) {
+                const double m = by_ac[i].pixels ? (double)by_ac[i].sum / (double)by_ac[i].pixels : 0.0;
+                std::fprintf(stderr, "  %s  pixels=%10llu  mean=%+.4f  sum=%+lld\n",
+                    ac_names[i], (unsigned long long)by_ac[i].pixels, m, (long long)by_ac[i].sum);
+            }
+            for (int i = 0; i < 4; ++i) {
+                const double m = by_q[i].pixels ? (double)by_q[i].sum / (double)by_q[i].pixels : 0.0;
+                std::fprintf(stderr, "  %s  pixels=%10llu  mean=%+.4f  sum=%+lld\n",
+                    q_names[i], (unsigned long long)by_q[i].pixels, m, (long long)by_q[i].sum);
+            }
+            if (dc_blocks) {
+                std::fprintf(stderr, "  decoded_dc: blocks=%llu mean=%+.4f mean_abs=%+.4f\n",
+                    (unsigned long long)dc_blocks,
+                    (double)sum_dc / (double)dc_blocks,
+                    (double)sum_abs_dc / (double)dc_blocks);
+            }
         }
     }
 };
 static Bink2ChromaSatCounters g_chroma_sat;
+
+static inline int Bk2DcBucket(int32_t dc) {
+    const int32_t a = dc < 0 ? -dc : dc;
+    if (a == 0) return 0;
+    if (a < 32) return 1;
+    if (a < 128) return 2;
+    if (a < 512) return 3;
+    return 4;
+}
+static inline int Bk2AcBucket(int32_t max_ac) {
+    if (max_ac == 0) return 0;
+    if (max_ac < 16) return 1;
+    if (max_ac < 64) return 2;
+    if (max_ac < 256) return 3;
+    return 4;
+}
+static inline int Bk2QBucket(int32_t q) {
+    if (q < 10) return 0;
+    if (q < 20) return 1;
+    if (q < 30) return 2;
+    return 3;
+}
 
 // idct_add: run IDCT on `block` and add (saturating) into dst[8x8].
 static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
@@ -2297,22 +2460,32 @@ static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
 }
 
 // Chroma variant: same arithmetic, plus saturation-event counters.
-static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block)
+// dc_hint / max_ac_hint / q_hint are for diagnostic bucketing only.
+static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
+                                int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
 {
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i,     8, 0);
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i * 8, 1, 6);
+    const int dc_b = Bk2DcBucket(dc_hint);
+    const int ac_b = Bk2AcBucket(max_ac_hint);
+    const int q_b  = Bk2QBucket(q_hint);
+    int64_t block_sum = 0;
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j) {
             const int32_t r = block[j * 8 + i];
             const int32_t s = (int32_t)dst[j] + r;
             g_chroma_sat.sum_residual += r;
             ++g_chroma_sat.pixels;
+            block_sum += r;
             if (s < 0)        ++g_chroma_sat.low;
             else if (s > 255) ++g_chroma_sat.high;
             dst[j] = Clip255(s);
         }
         dst += stride;
     }
+    g_chroma_sat.by_dc[dc_b].pixels += 64; g_chroma_sat.by_dc[dc_b].sum += block_sum;
+    g_chroma_sat.by_ac[ac_b].pixels += 64; g_chroma_sat.by_ac[ac_b].sum += block_sum;
+    g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
 }
 
 // Decode an inter luma plane and ADD its residual into dst[32x32 region].
@@ -2374,11 +2547,30 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
         return e && e[0] && e[0] != '0';
     }();
     if (skip_residual) return true;
+    // Diagnostic: BK2_CHROMA_DC_BIAS=N overrides the default +32 DC
+    // rounding term. Default 32 matches FFmpeg. 0 matches NihAV (drifts
+    // green). Signed-drift sweep re-done 2026-04-19 afternoon 2 after
+    // prior MAD sweep proved misleading.
+    static const int32_t chroma_dc_bias = []{
+        const char* e = std::getenv("BK2_CHROMA_DC_BIAS");
+        if (!e || !e[0]) return 32;
+        return std::atoi(e);
+    }();
     for (uint32_t j = 0; j < 4u; ++j) {
-        sub[j][0] = (int16_t)(dc[j] * 8 + 32);
+        int32_t max_ac = 0;
+        for (int k = 1; k < 64; ++k) {
+            const int32_t v = sub[j][k];
+            const int32_t a = v < 0 ? -v : v;
+            if (a > max_ac) max_ac = a;
+        }
+        ++g_chroma_sat.dc_blocks;
+        g_chroma_sat.sum_dc += dc[j];
+        g_chroma_sat.sum_abs_dc += (dc[j] < 0 ? -dc[j] : dc[j]);
+        sub[j][0] = (int16_t)(dc[j] * 8 + chroma_dc_bias);
         const int block_x = (j & 1) * 8;
         const int block_y = (j >> 1) * 8;
-        Bink2gChromaIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data());
+        Bink2gChromaIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data(),
+                            dc[j], max_ac, inter_q);
     }
     return true;
 }
