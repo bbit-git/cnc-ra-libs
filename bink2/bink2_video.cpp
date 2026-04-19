@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -2065,15 +2066,65 @@ static void PredictMv(uint32_t mb_flags,
 
 // ---- Motion compensation -------------------------------------------------
 // Chroma 1/4-pel filters (FFmpeg CH1/CH2/CH3 + CV1/CV2/CV3).
+// Chroma MC filter rounding modes. The quarter-pel `(sum+4)>>3` constant that
+// matches the FFmpeg/NihAV public decoders has +0.125/pixel bias on uniform
+// integer inputs, which accumulates into the "magenta bleed" class drift on
+// motion-heavy GDI* content (landed 2026-04-19 after triage on GDI13 +
+// TANKKILL validation). Default is now round-half-to-even on quarter-pel,
+// which cuts drift by ~5×. Half-pel stays round-half-up by default — flipping
+// it independently over-corrects to green (empirically confirmed in h0q2 vs
+// h1q2 sweep); there is a residual small green drift on some samples that is
+// still open. Env vars allow flipping each filter independently for debugging:
+//   Halfpel  (a+b)/2:
+//     0 (default): (a+b+1)>>1     round-half-up,     +0.25/px bias
+//     1:           (a+b)>>1        round-half-down,   -0.25/px bias
+//     2:           round-half-even, unbiased
+//   Quarterpel (6a+2b)/8 or (2a+6b)/8:
+//     0:           (sum+4)>>3      round-half-up,     +0.125/px bias  (legacy)
+//     1:           (sum+3)>>3      round-half-down,   -0.125/px bias
+//     2 (default): round-half-even, unbiased
+static int Bk2McHalfpelRoundMode()
+{
+    static const int mode = []{
+        const char* e = std::getenv("BK2_MC_HALFPEL_ROUND");
+        if (!e || !e[0]) return 0;
+        return std::atoi(e);
+    }();
+    return mode;
+}
+static int Bk2McQuarterpelRoundMode()
+{
+    static const int mode = []{
+        const char* e = std::getenv("BK2_MC_QUARTERPEL_ROUND");
+        if (!e || !e[0]) return 2;
+        return std::atoi(e);
+    }();
+    return mode;
+}
+static inline int32_t HalfPelAvg(int a, int b) {
+    const int mode = Bk2McHalfpelRoundMode();
+    if (mode == 1) return (a + b) >> 1;
+    if (mode == 2) {
+        const int sum = a + b;
+        return (sum + ((sum >> 1) & 1)) >> 1;
+    }
+    return (a + b + 1) >> 1;
+}
+static inline int32_t QuarterPelAvg(int sum) {
+    const int mode = Bk2McQuarterpelRoundMode();
+    if (mode == 1) return (sum + 3) >> 3;
+    if (mode == 2) return (sum + 3 + ((sum >> 3) & 1)) >> 3;
+    return (sum + 4) >> 3;
+}
 static inline int32_t ChH(int n, const uint8_t* s, int i) {
-    if (n == 1) return (6*s[i+0] + 2*s[i+1] + 4) >> 3;
-    if (n == 2) return (  s[i+0] +   s[i+1] + 1) >> 1;
-    return              (2*s[i+0] + 6*s[i+1] + 4) >> 3;
+    if (n == 1) return QuarterPelAvg(6*s[i+0] + 2*s[i+1]);
+    if (n == 2) return HalfPelAvg(s[i+0], s[i+1]);
+    return              QuarterPelAvg(2*s[i+0] + 6*s[i+1]);
 }
 static inline int32_t ChV(int n, const uint8_t* s, int stride) {
-    if (n == 1) return (6*s[0] + 2*s[stride] + 4) >> 3;
-    if (n == 2) return (  s[0] +   s[stride] + 1) >> 1;
-    return              (2*s[0] + 6*s[stride] + 4) >> 3;
+    if (n == 1) return QuarterPelAvg(6*s[0] + 2*s[stride]);
+    if (n == 2) return HalfPelAvg(s[0], s[stride]);
+    return              QuarterPelAvg(2*s[0] + 6*s[stride]);
 }
 static inline uint8_t Clip255(int32_t v) {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
@@ -2208,6 +2259,31 @@ static void LumaMcMacroblock(const Bink2MvBlock& mv,
     }
 }
 
+// Diagnostic counters for chroma IDCT-add saturation events. Updated only
+// when Bink2gIdctAdd is called via the chroma residual path (see
+// DecodeAndAddInterChromaPlane). Snapshot+reset around the per-frame outer
+// decode and print at process exit.
+struct Bink2ChromaSatCounters {
+    uint64_t low = 0;   // pixels clamped at 0 (sum < 0)
+    uint64_t high = 0;  // pixels clamped at 255 (sum > 255)
+    uint64_t pixels = 0; // total pixels seen
+    int64_t  sum_residual = 0; // signed sum of all chroma IDCT residuals
+    ~Bink2ChromaSatCounters() {
+        if (const char* e = std::getenv("BK2_REPORT_CHROMA_SAT");
+            e && e[0] && e[0] != '0' && pixels) {
+            std::fprintf(stderr,
+                "[BK2 chroma sat] pixels=%llu low=%llu high=%llu (asymmetry=%+lld) sum_residual=%+lld mean_resid=%+.4f\n",
+                (unsigned long long)pixels,
+                (unsigned long long)low,
+                (unsigned long long)high,
+                (long long)((int64_t)high - (int64_t)low),
+                (long long)sum_residual,
+                (double)sum_residual / (double)pixels);
+        }
+    }
+};
+static Bink2ChromaSatCounters g_chroma_sat;
+
 // idct_add: run IDCT on `block` and add (saturating) into dst[8x8].
 static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
 {
@@ -2216,6 +2292,25 @@ static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j)
             dst[j] = Clip255((int32_t)dst[j] + block[j * 8 + i]);
+        dst += stride;
+    }
+}
+
+// Chroma variant: same arithmetic, plus saturation-event counters.
+static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block)
+{
+    for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i,     8, 0);
+    for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i * 8, 1, 6);
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            const int32_t r = block[j * 8 + i];
+            const int32_t s = (int32_t)dst[j] + r;
+            g_chroma_sat.sum_residual += r;
+            ++g_chroma_sat.pixels;
+            if (s < 0)        ++g_chroma_sat.low;
+            else if (s > 255) ++g_chroma_sat.high;
+            dst[j] = Clip255(s);
+        }
         dst += stride;
     }
 }
@@ -2272,11 +2367,18 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
     if (!DecodeAcBlocks(bits, cbp, inter_q,
                         kBink2gInterQmat, sub)) return false;
     if (!dst) return true;
+    // Diagnostic: BK2_SKIP_CHROMA_RESIDUAL=1 consumes bits but skips the
+    // IDCT-add, isolating MC vs residual contribution to chroma drift.
+    static const bool skip_residual = []{
+        const char* e = std::getenv("BK2_SKIP_CHROMA_RESIDUAL");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (skip_residual) return true;
     for (uint32_t j = 0; j < 4u; ++j) {
         sub[j][0] = (int16_t)(dc[j] * 8 + 32);
         const int block_x = (j & 1) * 8;
         const int block_y = (j >> 1) * 8;
-        Bink2gIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data());
+        Bink2gChromaIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data());
     }
     return true;
 }
@@ -2621,14 +2723,24 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                                      frame.y.data(), frame.luma_stride,
                                      prev_frame.y.data(), prev_frame.luma_stride,
                                      mc_w, mc_h);
-                    ChromaMcMacroblock(absolute_mv, y_x / 2u, y_y / 2u,
-                                       frame.u.data(), frame.chroma_stride,
-                                       prev_frame.u.data(), prev_frame.chroma_stride,
-                                       mc_cw, mc_ch);
-                    ChromaMcMacroblock(absolute_mv, y_x / 2u, y_y / 2u,
-                                       frame.v.data(), frame.chroma_stride,
-                                       prev_frame.v.data(), prev_frame.chroma_stride,
-                                       mc_cw, mc_ch);
+                    // Diagnostic: BK2_SKIP_CHROMA_MC=1 leaves chroma seeded
+                    // by CopyPrevFrameMacroblock (pure passthrough at MB
+                    // position 0,0) and skips the 1/4-pel filter — isolates
+                    // MC-filter contribution from state-carryover.
+                    static const bool skip_chroma_mc = []{
+                        const char* e = std::getenv("BK2_SKIP_CHROMA_MC");
+                        return e && e[0] && e[0] != '0';
+                    }();
+                    if (!skip_chroma_mc) {
+                        ChromaMcMacroblock(absolute_mv, y_x / 2u, y_y / 2u,
+                                           frame.u.data(), frame.chroma_stride,
+                                           prev_frame.u.data(), prev_frame.chroma_stride,
+                                           mc_cw, mc_ch);
+                        ChromaMcMacroblock(absolute_mv, y_x / 2u, y_y / 2u,
+                                           frame.v.data(), frame.chroma_stride,
+                                           prev_frame.v.data(), prev_frame.chroma_stride,
+                                           mc_cw, mc_ch);
+                    }
                     if (Bink2EffectiveHasAlpha(header, plan.packet.frame_flags) &&
                         !frame.a.empty() && !prev_frame.a.empty()) {
                         LumaMcMacroblock(absolute_mv, y_x, y_y,
@@ -2826,11 +2938,30 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                             std::memcpy(frame.y.data() + (y_y + r) * frame.luma_stride + y_x,
                                         mb.pixels.y.data() + r * 32u, 32u);
                         }
-                        for (uint32_t r = 0; r < 16u; ++r) {
-                            std::memcpy(frame.v.data() + (uv_y + r) * frame.chroma_stride + uv_x,
-                                        mb.pixels.u.data() + r * 16u, 16u);
-                            std::memcpy(frame.u.data() + (uv_y + r) * frame.chroma_stride + uv_x,
-                                        mb.pixels.v.data() + r * 16u, 16u);
+                        // Diagnostic: BK2_SKIP_INTRA_IN_INTER_CHROMA=1 leaves
+                        // chroma at copy-prev (or whatever the inter seed was)
+                        // for INTRA-in-inter MBs. Isolates IIB chroma blit
+                        // contribution to drift.
+                        static const bool skip_iib_chroma = []{
+                            const char* e = std::getenv("BK2_SKIP_INTRA_IN_INTER_CHROMA");
+                            return e && e[0] && e[0] != '0';
+                        }();
+                        if (skip_iib_chroma) {
+                            // Seed from prev_frame chroma (CopyPrev) instead
+                            // of leaving stale/uninit data at IIB position.
+                            for (uint32_t r = 0; r < 16u; ++r) {
+                                std::memcpy(frame.u.data() + (uv_y + r) * frame.chroma_stride + uv_x,
+                                            prev_frame.u.data() + (uv_y + r) * prev_frame.chroma_stride + uv_x, 16u);
+                                std::memcpy(frame.v.data() + (uv_y + r) * frame.chroma_stride + uv_x,
+                                            prev_frame.v.data() + (uv_y + r) * prev_frame.chroma_stride + uv_x, 16u);
+                            }
+                        } else {
+                            for (uint32_t r = 0; r < 16u; ++r) {
+                                std::memcpy(frame.v.data() + (uv_y + r) * frame.chroma_stride + uv_x,
+                                            mb.pixels.u.data() + r * 16u, 16u);
+                                std::memcpy(frame.u.data() + (uv_y + r) * frame.chroma_stride + uv_x,
+                                            mb.pixels.v.data() + r * 16u, 16u);
+                            }
                         }
                         if (Bink2EffectiveHasAlpha(header, plan.packet.frame_flags) &&
                             !frame.a.empty()) {
