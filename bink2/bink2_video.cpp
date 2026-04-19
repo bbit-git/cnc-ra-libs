@@ -2116,6 +2116,20 @@ static inline int32_t QuarterPelAvg(int sum) {
     if (mode == 2) return (sum + 3 + ((sum >> 3) & 1)) >> 3;
     return (sum + 4) >> 3;
 }
+// BK2_MC_2D_U16_TEMP=1 switches the 2D separable chroma MC path to keep the
+// H-pass intermediate at full precision (no per-pass rounding/clipping) and
+// apply a single combined shift+clip at V-pass end. See NihAV
+// (`nihav-rad/src/codecs/bink2.rs:352-386`) — it does this and drifts in the
+// opposite direction on GDI* than us + FFmpeg, both of which do double
+// rounding on u8 temp. Gate lets us A/B whether the double-round is the
+// structural cause of the residual green drift on h0q2 default.
+static inline bool Bk2Mc2dU16Temp() {
+    static const bool on = []{
+        const char* e = std::getenv("BK2_MC_2D_U16_TEMP");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
 // MC sum-parity histogram. Populated by ChH/ChV when BK2_REPORT_MC_PARITY=1
 // is set; dumped by the dtor below. The quarter-pel sum 6a+2b is always
 // even, so only buckets {0,2,4,6} see non-zero counts — residents of
@@ -2228,19 +2242,167 @@ static inline uint8_t Clip255(int32_t v) {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
+// MV-edge instrumentation for ChromaMc8. Env gate BK2_REPORT_MC_EDGE=1.
+// Per handoff 2026-04-19 (late evening): residual -0.65 dU chroma drift on
+// GDI13 isn't scalar-rounding or structural-u16. Next hypothesis is MV
+// edge-handling: the early-return at `mv_x >= width` discards fully-OOB MVs
+// but doesn't clamp near-edge MVs where the +1 read-ahead (q-pel H) or
+// 9-row 2D temp (q-pel V) extends past the buffer. Count how many MC calls
+// fall into each bucket to decide whether edge paths are a meaningful
+// share of motion before touching code.
+struct Bink2McEdgeCounters {
+    uint64_t calls = 0;          // total ChromaMc8 calls
+    uint64_t fully_oob = 0;      // current early-return path
+    uint64_t in_bounds = 0;      // mv within [0,w)x[0,h), read-ahead also in-bounds
+    uint64_t near_right = 0;     // mv_x+ead >= width (read past right edge)
+    uint64_t near_bottom = 0;    // mv_y+ead >= height (read past bottom edge)
+    uint64_t near_both = 0;      // both right and bottom overflow
+    uint64_t pure_copy = 0;      // mode 0/0: no filter, 8x8 memcpy only
+    uint64_t hfilter = 0;        // h!=0, v==0 (horizontal only, 8 rows)
+    uint64_t vfilter = 0;        // h==0, v!=0 (vertical only, 9 rows)
+    uint64_t twoD = 0;           // h!=0 && v!=0 (2D, 9 rows)
+    uint64_t near_edge_pure = 0; // near-edge in pure-copy path
+    uint64_t near_edge_h = 0;    // near-edge in H-filter path
+    uint64_t near_edge_v = 0;    // near-edge in V-filter path
+    uint64_t near_edge_2d = 0;   // near-edge in 2D path (primary concern)
+    ~Bink2McEdgeCounters() {
+        if (const char* e = std::getenv("BK2_REPORT_MC_EDGE");
+            !(e && e[0] && e[0] != '0')) return;
+        if (!calls) return;
+        const double c = (double)calls;
+        std::fprintf(stderr,
+            "[BK2 mc edge] calls=%llu fully_oob=%llu (%.2f%%) "
+            "in_bounds=%llu near_right=%llu near_bottom=%llu near_both=%llu\n",
+            (unsigned long long)calls,
+            (unsigned long long)fully_oob, 100.0*fully_oob/c,
+            (unsigned long long)in_bounds,
+            (unsigned long long)near_right,
+            (unsigned long long)near_bottom,
+            (unsigned long long)near_both);
+        const uint64_t near_total = near_right + near_bottom + near_both;
+        const uint64_t filtered = calls - fully_oob;
+        std::fprintf(stderr,
+            "  near_edge_total=%llu (%.2f%% of all calls, %.2f%% of non-oob)\n",
+            (unsigned long long)near_total,
+            100.0*near_total/c,
+            filtered ? 100.0*near_total/(double)filtered : 0.0);
+        std::fprintf(stderr,
+            "  path  pure=%llu  h=%llu  v=%llu  2d=%llu\n",
+            (unsigned long long)pure_copy,
+            (unsigned long long)hfilter,
+            (unsigned long long)vfilter,
+            (unsigned long long)twoD);
+        std::fprintf(stderr,
+            "  near  pure=%llu  h=%llu  v=%llu  2d=%llu\n",
+            (unsigned long long)near_edge_pure,
+            (unsigned long long)near_edge_h,
+            (unsigned long long)near_edge_v,
+            (unsigned long long)near_edge_2d);
+    }
+};
+static Bink2McEdgeCounters g_mc_edge;
+static inline bool Bk2McEdgeEnabled() {
+    static const bool on = []{
+        const char* e = std::getenv("BK2_REPORT_MC_EDGE");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
+// Clamp-MV experiment. Default: off (preserve early-return behaviour).
+// When on, fully-OOB or near-edge MVs no longer early-return; instead,
+// a 9x9 edge-replicated source tile is materialised and the filter
+// runs against that. Hypothesis: GDI13's 57,580 fully-OOB calls leave
+// dst stale (prev-frame residue or undefined) which accumulates into
+// the residual -0.65 dU chroma drift; AFRICA has 0 OOB calls so is
+// unaffected. See 2026-04-19 late-evening-2 memory.
+static inline bool Bk2McClampMv() {
+    static const bool on = []{
+        const char* e = std::getenv("BK2_MC_CLAMP_MV");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
+
 static void ChromaMc8(uint8_t* dst, int stride,
                       const uint8_t* src, int sstride,
                       int width, int height,
                       int mv_x, int mv_y, int mode)
 {
-    if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return;
-    const uint8_t* msrc = src + mv_x + mv_y * sstride;
+    const int h_mode = mode & 3;
+    const int v_mode = (mode >> 2) & 3;
+    if (Bk2McEdgeEnabled()) {
+        ++g_mc_edge.calls;
+        // Read extent (max byte offset relative to msrc top-left). q-pel
+        // axes touch +1 ahead; 2D V-pass walks through 9 rows of temp.
+        // Pure-copy reads 8 samples x 8 rows; H-only 9 x 8; V-only 8 x 9;
+        // 2D 9 x 9.
+        const int x_ahead = (h_mode != 0 || v_mode != 0) ? 8 : 7;
+        const int y_ahead = (v_mode != 0 || h_mode != 0) ? 8 : 7;
+        // Actually: H-only has 8-row extent; V-only 9-row extent.
+        // Keep both dimensions' read-ahead conservative (8): any extent
+        // past width/height is an overshoot.
+        const bool oob = (mv_x < 0 || mv_x >= width ||
+                          mv_y < 0 || mv_y >= height);
+        if (oob) {
+            ++g_mc_edge.fully_oob;
+        } else {
+            const bool over_r = (mv_x + x_ahead >= width);
+            const bool over_b = (mv_y + y_ahead >= height);
+            if (over_r && over_b)       ++g_mc_edge.near_both;
+            else if (over_r)            ++g_mc_edge.near_right;
+            else if (over_b)            ++g_mc_edge.near_bottom;
+            else                        ++g_mc_edge.in_bounds;
+            const bool near = (over_r || over_b);
+            if (h_mode == 0 && v_mode == 0) {
+                ++g_mc_edge.pure_copy;
+                if (near) ++g_mc_edge.near_edge_pure;
+            } else if (v_mode == 0) {
+                ++g_mc_edge.hfilter;
+                if (near) ++g_mc_edge.near_edge_h;
+            } else if (h_mode == 0) {
+                ++g_mc_edge.vfilter;
+                if (near) ++g_mc_edge.near_edge_v;
+            } else {
+                ++g_mc_edge.twoD;
+                if (near) ++g_mc_edge.near_edge_2d;
+            }
+        }
+    }
     const int h = mode & 3;         // horizontal 1/4-pel sub-mode (0..3)
     const int v = (mode >> 2) & 3;  // vertical   1/4-pel sub-mode (0..3)
 
+    const uint8_t* msrc;
+    int msrc_stride;
+    uint8_t clamp_tile[9 * 9];
+    if (Bk2McClampMv()) {
+        // Worst-case filter footprint is 9x9 (2D q-pel). Build an
+        // edge-clamped 9x9 tile starting at (mv_x, mv_y). For pure-copy
+        // and 1D filter modes this is slightly more work than needed
+        // but the extra 8-17 bytes of clamped fetch are negligible next
+        // to the drift-correlation signal we're testing.
+        for (int j = 0; j < 9; ++j) {
+            int sy = mv_y + j;
+            if (sy < 0) sy = 0;
+            else if (sy >= height) sy = height - 1;
+            const uint8_t* row = src + sy * sstride;
+            for (int i = 0; i < 9; ++i) {
+                int sx = mv_x + i;
+                if (sx < 0) sx = 0;
+                else if (sx >= width) sx = width - 1;
+                clamp_tile[j * 9 + i] = row[sx];
+            }
+        }
+        msrc = clamp_tile;
+        msrc_stride = 9;
+    } else {
+        if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return;
+        msrc = src + mv_x + mv_y * sstride;
+        msrc_stride = sstride;
+    }
+
     if (h == 0 && v == 0) {
         for (int j = 0; j < 8; ++j) {
-            std::memcpy(dst + j*stride, msrc + j*sstride, 8);
+            std::memcpy(dst + j*stride, msrc + j*msrc_stride, 8);
         }
         return;
     }
@@ -2249,16 +2411,70 @@ static void ChromaMc8(uint8_t* dst, int stride,
         for (int j = 0; j < 8; ++j) {
             for (int i = 0; i < 8; ++i) dst[i] = Clip255(ChH(h, msrc, i));
             dst  += stride;
-            msrc += sstride;
+            msrc += msrc_stride;
         }
         return;
     }
     if (h == 0) {
         // vertical-only filter
         for (int j = 0; j < 8; ++j) {
-            for (int i = 0; i < 8; ++i) dst[i*stride] = Clip255(ChV(v, msrc + i*sstride, sstride));
+            for (int i = 0; i < 8; ++i) dst[i*stride] = Clip255(ChV(v, msrc + i*msrc_stride, msrc_stride));
             dst  += 1;
             msrc += 1;
+        }
+        return;
+    }
+    if (Bk2Mc2dU16Temp()) {
+        // Raw-sum u16 temp: store H-pass numerator without /denom/clip.
+        // n=1 -> 6a+2b (max 6*255+2*255=2040, fits u16)
+        // n=2 -> a+b   (max 510)
+        // n=3 -> 2a+6b (max 2040)
+        // Then V pass forms v-combination of those and applies a single
+        // combined shift+round+clip. Denominators: q-pel axes are /8,
+        // half-pel axis /2. Combined shift = log2(h_den * v_den).
+        uint16_t temp[9 * 8];
+        auto h_raw = [&](const uint8_t* s, int i) -> int32_t {
+            if (h == 1) return 6 * s[i+0] + 2 * s[i+1];
+            if (h == 2) return     s[i+0] +     s[i+1];
+            return             2 * s[i+0] + 6 * s[i+1];
+        };
+        for (int i = 0; i < 9; ++i) {
+            for (int j = 0; j < 8; ++j) temp[i*8+j] = (uint16_t)h_raw(msrc, j);
+            msrc += msrc_stride;
+        }
+        // Combined denom.
+        const int h_den = (h == 2) ? 2 : 8;
+        const int v_den = (v == 2) ? 2 : 8;
+        const int combined = h_den * v_den;            // 4/16/64
+        const int shift = (combined == 64) ? 6 : (combined == 16 ? 4 : 2);
+        const int rounder = 1 << (shift - 1);
+        const int halfpel_mode = Bk2McHalfpelRoundMode();
+        const int quarterpel_mode = Bk2McQuarterpelRoundMode();
+        // Pick rounding mode aligned with the more-critical axis (q-pel if
+        // present, else half-pel). Half-even matches h0q2 default intent.
+        const int round_mode = (h_den == 8 || v_den == 8)
+            ? quarterpel_mode
+            : halfpel_mode;
+        auto combine = [&](int32_t a, int32_t b) -> int32_t {
+            if (v == 1) return 6 * a + 2 * b;
+            if (v == 2) return     a +     b;
+            return             2 * a + 6 * b;
+        };
+        for (int j = 0; j < 8; ++j) {
+            for (int i = 0; i < 8; ++i) {
+                const int32_t s = combine((int32_t)temp[j*8 + i],
+                                          (int32_t)temp[(j+1)*8 + i]);
+                int32_t out;
+                if (round_mode == 1) {
+                    out = (s + rounder - 1) >> shift;       // half-down
+                } else if (round_mode == 2) {
+                    out = (s + rounder - 1 + ((s >> shift) & 1)) >> shift; // half-even
+                } else {
+                    out = (s + rounder) >> shift;           // half-up
+                }
+                dst[i] = Clip255(out);
+            }
+            dst += stride;
         }
         return;
     }
@@ -2266,7 +2482,7 @@ static void ChromaMc8(uint8_t* dst, int stride,
     uint8_t temp[9 * 8];
     for (int i = 0; i < 9; ++i) {
         for (int j = 0; j < 8; ++j) temp[i*8+j] = Clip255(ChH(h, msrc, j));
-        msrc += sstride;
+        msrc += msrc_stride;
     }
     for (int j = 0; j < 8; ++j) {
         for (int i = 0; i < 8; ++i) dst[i] = Clip255(ChV(v, temp + j*8 + i, 8));
@@ -2522,6 +2738,15 @@ static bool DecodeAndAddInterLumaPlane(Bink2BitReader& bits,
 }
 
 // Decode an inter chroma plane and ADD its residual into dst[16x16 region].
+// Diagnostic: file-static MB coords set by the slice loop immediately
+// before each DecodeAndAddInterChromaPlane call. Consumed when
+// BK2_DUMP_CHROMA_MB is set so the per-MB summary line can report which
+// MB it describes (plane U/V, col, row). Not concurrency-safe — the
+// slice loop is single-threaded.
+static int  g_dbg_chroma_mb_col = 0;
+static int  g_dbg_chroma_mb_row = 0;
+static char g_dbg_chroma_mb_plane = 'U';
+
 static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
                                          uint32_t& prev_cbp,
                                          int32_t inter_q,
@@ -2539,6 +2764,32 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
     std::array<std::array<int16_t, 64>, 4> sub = {};
     if (!DecodeAcBlocks(bits, cbp, inter_q,
                         kBink2gInterQmat, sub)) return false;
+    // Diagnostic: BK2_DUMP_CHROMA_MB=1 emits one line per inter chroma
+    // plane call with cbp, per-subblock DC and max|AC|. Used in tandem
+    // with the debugger's "FRAME_BEGIN idx=N" stderr marker (emitted by
+    // --dump-all-yuva) to locate inter chroma MBs with zero residual —
+    // their final chroma pixels equal the MC output and can be diffed
+    // directly against BP64 to isolate MC-filter bugs.
+    static const bool dump_chroma_mb = []{
+        const char* e = std::getenv("BK2_DUMP_CHROMA_MB");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (dump_chroma_mb) {
+        int maxac[4] = {0, 0, 0, 0};
+        for (int j = 0; j < 4; ++j) {
+            for (int k = 1; k < 64; ++k) {
+                const int a = sub[j][k] < 0 ? -sub[j][k] : sub[j][k];
+                if (a > maxac[j]) maxac[j] = a;
+            }
+        }
+        std::fprintf(stderr,
+            "CHROMA_MB col=%d row=%d plane=%c cbp=0x%x q=%d "
+            "dc=%d,%d,%d,%d maxac=%d,%d,%d,%d\n",
+            g_dbg_chroma_mb_col, g_dbg_chroma_mb_row, g_dbg_chroma_mb_plane,
+            cbp, inter_q,
+            dc[0], dc[1], dc[2], dc[3],
+            maxac[0], maxac[1], maxac[2], maxac[3]);
+    }
     if (!dst) return true;
     // Diagnostic: BK2_SKIP_CHROMA_RESIDUAL=1 consumes bits but skips the
     // IDCT-add, isolating MC vs residual contribution to chroma drift.
@@ -2948,6 +3199,25 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                     update_q(0, true);
                     update_q(0, false);
                 }
+                // Diagnostic: MOTION MBs have pure-MC chroma (no residual).
+                // Their 16x16 chroma region in the output frame IS the MC
+                // filter output, which makes them a direct target for pixel
+                // diff against BP64 to localize chroma-MC bugs.
+                if (type == kBink2BlockMotion) {
+                    static const bool dump_chroma_mb = []{
+                        const char* e = std::getenv("BK2_DUMP_CHROMA_MB");
+                        return e && e[0] && e[0] != '0';
+                    }();
+                    if (dump_chroma_mb) {
+                        std::fprintf(stderr,
+                            "MOTION_MB col=%u row=%u mv0=%d,%d mv1=%d,%d mv2=%d,%d mv3=%d,%d\n",
+                            (unsigned)col, (unsigned)frame_row,
+                            (int)absolute_mv.v[0][0], (int)absolute_mv.v[0][1],
+                            (int)absolute_mv.v[1][0], (int)absolute_mv.v[1][1],
+                            (int)absolute_mv.v[2][0], (int)absolute_mv.v[2][1],
+                            (int)absolute_mv.v[3][0], (int)absolute_mv.v[3][1]);
+                    }
+                }
 
                 if (type == kBink2BlockIntra) {
                     // FFmpeg invokes bink2g_predict_mv with a zero-delta MV
@@ -3204,9 +3474,16 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                     }
                     if (chroma_flag) {
                         // Bink2 stream stores chroma in Cr,Cb (swapped) order.
+                        g_dbg_chroma_mb_col = (int)col;
+                        g_dbg_chroma_mb_row = (int)frame_row;
+                        g_dbg_chroma_mb_plane = 'V'; // first call writes V plane
                         if (!DecodeAndAddInterChromaPlane(bits, u_cbp_inter, inter_q,
-                                                          v_dst, (int)frame.chroma_stride) ||
-                            !DecodeAndAddInterChromaPlane(bits, v_cbp_inter, inter_q,
+                                                          v_dst, (int)frame.chroma_stride)) {
+                            frame.decode_mb_col = col; frame.decode_mb_row = frame_row;
+                            frame.failure_stage = 124u; stopped = true; break;
+                        }
+                        g_dbg_chroma_mb_plane = 'U';
+                        if (!DecodeAndAddInterChromaPlane(bits, v_cbp_inter, inter_q,
                                                           u_dst, (int)frame.chroma_stride)) {
                             frame.decode_mb_col = col; frame.decode_mb_row = frame_row;
                             frame.failure_stage = 124u; stopped = true; break;
