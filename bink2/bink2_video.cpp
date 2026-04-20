@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -2807,21 +2809,37 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
         if (!e || !e[0]) return 32;
         return std::atoi(e);
     }();
+    // Diagnostic split: isolate DC vs AC contribution of the chroma inter
+    // residual. BK2_SKIP_CHROMA_RESIDUAL_DC=1 zeros the DC term, keeping AC.
+    // BK2_SKIP_CHROMA_RESIDUAL_AC=1 zeros AC coefficients, keeping DC.
+    static const bool skip_residual_dc = []{
+        const char* e = std::getenv("BK2_SKIP_CHROMA_RESIDUAL_DC");
+        return e && e[0] && e[0] != '0';
+    }();
+    static const bool skip_residual_ac = []{
+        const char* e = std::getenv("BK2_SKIP_CHROMA_RESIDUAL_AC");
+        return e && e[0] && e[0] != '0';
+    }();
     for (uint32_t j = 0; j < 4u; ++j) {
+        if (skip_residual_ac) {
+            for (int k = 1; k < 64; ++k) sub[j][k] = 0;
+        }
         int32_t max_ac = 0;
         for (int k = 1; k < 64; ++k) {
             const int32_t v = sub[j][k];
             const int32_t a = v < 0 ? -v : v;
             if (a > max_ac) max_ac = a;
         }
+        int32_t dc_val = dc[j];
+        if (skip_residual_dc) dc_val = 0;
         ++g_chroma_sat.dc_blocks;
-        g_chroma_sat.sum_dc += dc[j];
-        g_chroma_sat.sum_abs_dc += (dc[j] < 0 ? -dc[j] : dc[j]);
-        sub[j][0] = (int16_t)(dc[j] * 8 + chroma_dc_bias);
+        g_chroma_sat.sum_dc += dc_val;
+        g_chroma_sat.sum_abs_dc += (dc_val < 0 ? -dc_val : dc_val);
+        sub[j][0] = (int16_t)(dc_val * 8 + chroma_dc_bias);
         const int block_x = (j & 1) * 8;
         const int block_y = (j >> 1) * 8;
         Bink2gChromaIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data(),
-                            dc[j], max_ac, inter_q);
+                            dc_val, max_ac, inter_q);
     }
     return true;
 }
@@ -2975,6 +2993,31 @@ static void CopyPrevFrameMacroblock(const Bink2DecodedFrame& prev,
     }
 }
 
+// ---- BK2_MB_TRACE per-MB diagnostic ----
+// Enable with BK2_MB_TRACE=1. Filter:
+//   BK2_MB_TRACE_FRAME=N   (N-th inter frame, 1-indexed; omit = all)
+//   BK2_MB_TRACE_ROWS=r0:r1  (inclusive)
+//   BK2_MB_TRACE_COLS=c0:c1  (inclusive)
+// One stderr line per MB with type, MV, q-intra/q-inter, CBP intra/inter.
+static std::atomic<int> g_bk2_mbtrace_interframe_counter{0};
+static int g_bk2_mbtrace_enable = -1;
+static int g_bk2_mbtrace_frame  = -1;
+static int g_bk2_mbtrace_r0 = 0, g_bk2_mbtrace_r1 = 1 << 30;
+static int g_bk2_mbtrace_c0 = 0, g_bk2_mbtrace_c1 = 1 << 30;
+static void Bk2MbTraceInit()
+{
+    if (g_bk2_mbtrace_enable != -1) return;
+    const char* e = std::getenv("BK2_MB_TRACE");
+    g_bk2_mbtrace_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (!g_bk2_mbtrace_enable) return;
+    if (const char* f = std::getenv("BK2_MB_TRACE_FRAME"))
+        g_bk2_mbtrace_frame = std::atoi(f);
+    if (const char* r = std::getenv("BK2_MB_TRACE_ROWS"))
+        std::sscanf(r, "%d:%d", &g_bk2_mbtrace_r0, &g_bk2_mbtrace_r1);
+    if (const char* c = std::getenv("BK2_MB_TRACE_COLS"))
+        std::sscanf(c, "%d:%d", &g_bk2_mbtrace_c0, &g_bk2_mbtrace_c1);
+}
+
 bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                                      const Bink2FramePlan& plan,
                                      const std::vector<uint8_t>& packet,
@@ -2982,6 +3025,15 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                                      Bink2DecodedFrame& frame)
 {
     frame = {};
+
+    Bk2MbTraceInit();
+    const int bk2_trace_frame_idx =
+        g_bk2_mbtrace_enable
+            ? (g_bk2_mbtrace_interframe_counter.fetch_add(1) + 1)
+            : 0;
+    const bool bk2_trace_this_frame =
+        g_bk2_mbtrace_enable &&
+        (g_bk2_mbtrace_frame < 0 || g_bk2_mbtrace_frame == bk2_trace_frame_idx);
 
     if (!header.Is_Valid()) return false;
     if (packet.empty()) return false;
@@ -3501,6 +3553,32 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                             frame.failure_stage = 125u; stopped = true; break;
                         }
                     }
+                }
+
+                if (bk2_trace_this_frame &&
+                    (int)frame_row >= g_bk2_mbtrace_r0 && (int)frame_row <= g_bk2_mbtrace_r1 &&
+                    (int)col      >= g_bk2_mbtrace_c0 && (int)col      <= g_bk2_mbtrace_c1) {
+                    const char* tn =
+                        type == kBink2BlockMotion  ? "MOTION"  :
+                        type == kBink2BlockResidue ? "RESIDUE" :
+                        type == kBink2BlockSkip    ? "SKIP"    :
+                        type == kBink2BlockIntra   ? "INTRA"   : "?";
+                    const Bink2MvBlock& mv = current_row_mv[col];
+                    std::fprintf(stderr,
+                        "MBTRACE f=%d r=%u c=%u type=%-7s "
+                        "mv=[%d,%d|%d,%d|%d,%d|%d,%d] "
+                        "qI=%d qP=%d "
+                        "cbpI=[y=%x u=%x v=%x a=%x] cbpP=[y=%x u=%x v=%x a=%x]\n",
+                        bk2_trace_frame_idx, (unsigned)frame_row, (unsigned)col, tn,
+                        (int)mv.v[0][0], (int)mv.v[0][1],
+                        (int)mv.v[1][0], (int)mv.v[1][1],
+                        (int)mv.v[2][0], (int)mv.v[2][1],
+                        (int)mv.v[3][0], (int)mv.v[3][1],
+                        (int)current_row_intra_q[col], (int)current_row_inter_q[col],
+                        (unsigned)y_cbp_intra, (unsigned)u_cbp_intra,
+                        (unsigned)v_cbp_intra, (unsigned)a_cbp_intra,
+                        (unsigned)y_cbp_inter, (unsigned)u_cbp_inter,
+                        (unsigned)v_cbp_inter, (unsigned)a_cbp_inter);
                 }
 
                 frame.decoded_macroblocks[(size_t)frame_row * frame.macroblock_stride + col] = 255u;
