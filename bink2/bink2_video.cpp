@@ -2098,7 +2098,7 @@ static int Bk2McQuarterpelRoundMode()
 {
     static const int mode = []{
         const char* e = std::getenv("BK2_MC_QUARTERPEL_ROUND");
-        if (!e || !e[0]) return 2;
+        if (!e || !e[0]) return 0;
         return std::atoi(e);
     }();
     return mode;
@@ -2128,7 +2128,8 @@ static inline int32_t QuarterPelAvg(int sum) {
 static inline bool Bk2Mc2dU16Temp() {
     static const bool on = []{
         const char* e = std::getenv("BK2_MC_2D_U16_TEMP");
-        return e && e[0] && e[0] != '0';
+        if (!e || !e[0]) return true;
+        return e[0] != '0';
     }();
     return on;
 }
