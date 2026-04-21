@@ -3652,6 +3652,29 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                         const char* e = std::getenv("BK2_SKIP_CHROMA_MC");
                         return e && e[0] && e[0] != '0';
                     }();
+                    // M9.20 diag: dump chroma-MB MV + per-sub-block mode so
+                    // the SOVIET9 injection-frame analysis can identify which
+                    // ChromaMc8 code path is in use. Reuses the existing
+                    // BK2_DUMP_INTER_CHROMA_MB_{FRAME,ROWS,COLS} filter.
+                    Bk2DumpChromaInit();
+                    g_dbg_chroma_mb_col = (int)col;
+                    g_dbg_chroma_mb_row = (int)frame_row;
+                    if (g_bk2_dump_chroma_residue_enable && Bk2DumpChromaMatch()) {
+                        const int m0 = (absolute_mv.v[0][0] & 3) | ((absolute_mv.v[0][1] & 3) << 2);
+                        const int m1 = (absolute_mv.v[1][0] & 3) | ((absolute_mv.v[1][1] & 3) << 2);
+                        const int m2 = (absolute_mv.v[2][0] & 3) | ((absolute_mv.v[2][1] & 3) << 2);
+                        const int m3 = (absolute_mv.v[3][0] & 3) | ((absolute_mv.v[3][1] & 3) << 2);
+                        std::fprintf(stderr,
+                            "CHROMA_MC_MV f=%d r=%d c=%d y_xy=%u,%u type=%d "
+                            "mv=[%d,%d|%d,%d|%d,%d|%d,%d] mode=[%d,%d,%d,%d]\n",
+                            g_dbg_luma_frame_idx, (int)frame_row, (int)col,
+                            (unsigned)y_x, (unsigned)y_y, (int)type,
+                            (int)absolute_mv.v[0][0], (int)absolute_mv.v[0][1],
+                            (int)absolute_mv.v[1][0], (int)absolute_mv.v[1][1],
+                            (int)absolute_mv.v[2][0], (int)absolute_mv.v[2][1],
+                            (int)absolute_mv.v[3][0], (int)absolute_mv.v[3][1],
+                            m0, m1, m2, m3);
+                    }
                     if (!skip_chroma_mc) {
                         ChromaMcMacroblock(absolute_mv, y_x / 2u, y_y / 2u,
                                            frame.u.data(), frame.chroma_stride,
