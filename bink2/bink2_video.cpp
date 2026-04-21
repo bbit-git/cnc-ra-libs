@@ -2864,6 +2864,75 @@ static void Bk2DumpLumaTile32(const char* tag, const uint8_t* dst, int stride)
     }
 }
 
+// Chroma MB sidecar globals (moved above their original location
+// near DecodeAndAddInterChromaPlane so the chroma dump helpers can
+// reference them). The slice loop sets these before each call.
+static int  g_dbg_chroma_mb_col = 0;
+static int  g_dbg_chroma_mb_row = 0;
+static char g_dbg_chroma_mb_plane = 'U';
+
+// ---- BK2_DUMP_INTER_CHROMA_MB diagnostic ----
+// Mirror of the luma dump hook for the chroma inter path. Emits
+// per-MB BEGIN / DC / BASE (16x16) / SUB[b] / POST (16x16) / END so
+// the M9.5 residue-classification harness can run against U/V at the
+// same MB coords. Frame index piggybacks on g_dbg_luma_frame_idx
+// (single counter per inter frame). Coords come from
+// g_dbg_chroma_mb_{col,row,plane} which the slice loop already sets.
+//   BK2_DUMP_INTER_CHROMA_MB=1
+//   BK2_DUMP_INTER_CHROMA_MB_FRAME=N[:M]  1-indexed inter-frame
+//   BK2_DUMP_INTER_CHROMA_MB_ROWS=r0:r1   inclusive (chroma-grid MB)
+//   BK2_DUMP_INTER_CHROMA_MB_COLS=c0:c1
+static int g_bk2_dump_chroma_residue_enable = -1;
+static int g_bk2_dump_chroma_frame = -1;
+static int g_bk2_dump_chroma_frame1 = -1;
+static int g_bk2_dump_chroma_r0 = 0, g_bk2_dump_chroma_r1 = 1 << 30;
+static int g_bk2_dump_chroma_c0 = 0, g_bk2_dump_chroma_c1 = 1 << 30;
+
+static void Bk2DumpChromaInit()
+{
+    if (g_bk2_dump_chroma_residue_enable != -1) return;
+    const char* e = std::getenv("BK2_DUMP_INTER_CHROMA_MB");
+    g_bk2_dump_chroma_residue_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (!g_bk2_dump_chroma_residue_enable) return;
+    const char* f = std::getenv("BK2_DUMP_INTER_CHROMA_MB_FRAME");
+    if (f) {
+        int a = -1, b = -1;
+        int n = std::sscanf(f, "%d:%d", &a, &b);
+        g_bk2_dump_chroma_frame = a;
+        g_bk2_dump_chroma_frame1 = (n == 2) ? b : a;
+    }
+    const char* r = std::getenv("BK2_DUMP_INTER_CHROMA_MB_ROWS");
+    if (r) std::sscanf(r, "%d:%d", &g_bk2_dump_chroma_r0, &g_bk2_dump_chroma_r1);
+    const char* c = std::getenv("BK2_DUMP_INTER_CHROMA_MB_COLS");
+    if (c) std::sscanf(c, "%d:%d", &g_bk2_dump_chroma_c0, &g_bk2_dump_chroma_c1);
+}
+
+static bool Bk2DumpChromaMatch()
+{
+    if (g_bk2_dump_chroma_frame >= 0 &&
+        (g_dbg_luma_frame_idx < g_bk2_dump_chroma_frame ||
+         g_dbg_luma_frame_idx > g_bk2_dump_chroma_frame1)) return false;
+    if (g_dbg_chroma_mb_row < g_bk2_dump_chroma_r0 ||
+        g_dbg_chroma_mb_row > g_bk2_dump_chroma_r1) return false;
+    if (g_dbg_chroma_mb_col < g_bk2_dump_chroma_c0 ||
+        g_dbg_chroma_mb_col > g_bk2_dump_chroma_c1) return false;
+    return true;
+}
+
+static void Bk2DumpChromaTile16(const char* tag, const uint8_t* dst, int stride)
+{
+    std::fprintf(stderr, "%s f=%d r=%d c=%d plane=%c 16x16=",
+                 tag, g_dbg_luma_frame_idx,
+                 g_dbg_chroma_mb_row, g_dbg_chroma_mb_col, g_dbg_chroma_mb_plane);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            std::fprintf(stderr, "%u%s",
+                         (unsigned)dst[y * stride + x],
+                         (y == 15 && x == 15) ? "\n" : ",");
+        }
+    }
+}
+
 // Decode an inter luma plane and ADD its residual into dst[32x32 region].
 static bool DecodeAndAddInterLumaPlane(Bink2BitReader& bits,
                                        uint32_t frame_flags,
@@ -2943,14 +3012,8 @@ static bool DecodeAndAddInterLumaPlane(Bink2BitReader& bits,
 
 // Decode an inter chroma plane and ADD its residual into dst[16x16 region].
 // Diagnostic: file-static MB coords set by the slice loop immediately
-// before each DecodeAndAddInterChromaPlane call. Consumed when
-// BK2_DUMP_CHROMA_MB is set so the per-MB summary line can report which
-// MB it describes (plane U/V, col, row). Not concurrency-safe — the
-// slice loop is single-threaded.
-static int  g_dbg_chroma_mb_col = 0;
-static int  g_dbg_chroma_mb_row = 0;
-static char g_dbg_chroma_mb_plane = 'U';
-
+// before each DecodeAndAddInterChromaPlane call — consumed by the
+// CHROMA_MB / CHROMA_MB_* dump hooks (definitions moved above).
 static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
                                          uint32_t& prev_cbp,
                                          int32_t inter_q,
@@ -2995,13 +3058,35 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
             maxac[0], maxac[1], maxac[2], maxac[3]);
     }
     if (!dst) return true;
+    Bk2DumpChromaInit();
+    const bool dump_chroma_tile =
+        g_bk2_dump_chroma_residue_enable && Bk2DumpChromaMatch();
+    if (dump_chroma_tile) {
+        std::fprintf(stderr,
+            "CHROMA_MB_BEGIN f=%d r=%d c=%d plane=%c q=%d cbp=0x%x\n",
+            g_dbg_luma_frame_idx, g_dbg_chroma_mb_row, g_dbg_chroma_mb_col,
+            g_dbg_chroma_mb_plane, (int)inter_q, (unsigned)cbp);
+        std::fprintf(stderr,
+            "CHROMA_MB_DC f=%d r=%d c=%d dc=%d,%d,%d,%d\n",
+            g_dbg_luma_frame_idx, g_dbg_chroma_mb_row, g_dbg_chroma_mb_col,
+            dc[0], dc[1], dc[2], dc[3]);
+        Bk2DumpChromaTile16("CHROMA_MB_BASE", dst, stride);
+    }
     // Diagnostic: BK2_SKIP_CHROMA_RESIDUAL=1 consumes bits but skips the
     // IDCT-add, isolating MC vs residual contribution to chroma drift.
     static const bool skip_residual = []{
         const char* e = std::getenv("BK2_SKIP_CHROMA_RESIDUAL");
         return e && e[0] && e[0] != '0';
     }();
-    if (skip_residual) return true;
+    if (skip_residual) {
+        if (dump_chroma_tile) {
+            Bk2DumpChromaTile16("CHROMA_MB_POST", dst, stride);
+            std::fprintf(stderr, "CHROMA_MB_END f=%d r=%d c=%d plane=%c\n",
+                g_dbg_luma_frame_idx, g_dbg_chroma_mb_row,
+                g_dbg_chroma_mb_col, g_dbg_chroma_mb_plane);
+        }
+        return true;
+    }
     // Diagnostic: BK2_CHROMA_DC_BIAS=N overrides the default +32 DC
     // rounding term. Default 32 matches FFmpeg. 0 matches NihAV (drifts
     // green). Signed-drift sweep re-done 2026-04-19 afternoon 2 after
@@ -3038,10 +3123,26 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
         g_chroma_sat.sum_dc += dc_val;
         g_chroma_sat.sum_abs_dc += (dc_val < 0 ? -dc_val : dc_val);
         sub[j][0] = (int16_t)(dc_val * 8 + chroma_dc_bias);
+        if (dump_chroma_tile) {
+            std::fprintf(stderr,
+                "CHROMA_SUB f=%d r=%d c=%d plane=%c b=%u coeffs=",
+                g_dbg_luma_frame_idx, g_dbg_chroma_mb_row, g_dbg_chroma_mb_col,
+                g_dbg_chroma_mb_plane, (unsigned)j);
+            for (int k = 0; k < 64; ++k) {
+                std::fprintf(stderr, "%d%s",
+                             (int)sub[j][k], k == 63 ? "\n" : ",");
+            }
+        }
         const int block_x = (j & 1) * 8;
         const int block_y = (j >> 1) * 8;
         Bink2gChromaIdctAdd(dst + block_y * stride + block_x, stride, sub[j].data(),
                             dc_val, max_ac, inter_q);
+    }
+    if (dump_chroma_tile) {
+        Bk2DumpChromaTile16("CHROMA_MB_POST", dst, stride);
+        std::fprintf(stderr, "CHROMA_MB_END f=%d r=%d c=%d plane=%c\n",
+            g_dbg_luma_frame_idx, g_dbg_chroma_mb_row,
+            g_dbg_chroma_mb_col, g_dbg_chroma_mb_plane);
     }
     return true;
 }
@@ -3238,8 +3339,9 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
         (g_bk2_mbtrace_frame < 0 || g_bk2_mbtrace_frame == bk2_trace_frame_idx);
 
     Bk2DumpLumaInit();
+    Bk2DumpChromaInit();
     if (g_bk2_dump_luma_residue_enable || g_bk2_dump_luma_mc_enable
-        || g_bk2_dump_luma_mc_src_enable) {
+        || g_bk2_dump_luma_mc_src_enable || g_bk2_dump_chroma_residue_enable) {
         g_dbg_luma_frame_idx =
             g_bk2_dump_luma_interframe_counter.fetch_add(1) + 1;
     }
