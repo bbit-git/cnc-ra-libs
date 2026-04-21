@@ -2945,6 +2945,11 @@ static int g_bk2_dump_chroma_c0 = 0, g_bk2_dump_chroma_c1 = 1 << 30;
 // BK2_DUMP_INTER_CHROMA_MB so either hook works in isolation.
 static int g_bk2_dump_frame_end_chroma = -1;
 static int g_bk2_dump_chroma_copyprev = -1;
+// M9.25: dump IIB chroma neighbour DC + decoded mb.pixels.{u,v} from
+// inside DecodeAndReconstructIntraInInter. Reuses
+// BK2_DUMP_INTER_CHROMA_MB_{FRAME,ROWS,COLS} filter; gated by
+// BK2_DUMP_IIB_CHROMA=1.
+static int g_bk2_dump_iib_chroma = -1;
 
 static void Bk2DumpChromaInit()
 {
@@ -2955,9 +2960,12 @@ static void Bk2DumpChromaInit()
     g_bk2_dump_frame_end_chroma = (efe && efe[0] && efe[0] != '0') ? 1 : 0;
     const char* ecp = std::getenv("BK2_DUMP_CHROMA_COPYPREV");
     g_bk2_dump_chroma_copyprev = (ecp && ecp[0] && ecp[0] != '0') ? 1 : 0;
+    const char* eiib = std::getenv("BK2_DUMP_IIB_CHROMA");
+    g_bk2_dump_iib_chroma = (eiib && eiib[0] && eiib[0] != '0') ? 1 : 0;
     if (!g_bk2_dump_chroma_residue_enable &&
         !g_bk2_dump_frame_end_chroma &&
-        !g_bk2_dump_chroma_copyprev) return;
+        !g_bk2_dump_chroma_copyprev &&
+        !g_bk2_dump_iib_chroma) return;
     const char* f = std::getenv("BK2_DUMP_INTER_CHROMA_MB_FRAME");
     if (f) {
         int a = -1, b = -1;
@@ -3330,6 +3338,48 @@ static bool DecodeAndReconstructIntraInInter(
         ReconstructPlaneBlocks(out_mb.pixels.a, 32, out_mb.a_blocks, out_a_dc,
                                kLumaRepos, true);
     }
+
+    // M9.25: dump IIB chroma neighbour DC + decoded pixels. Convention:
+    //   - "u" parameters here are the FIRST-decoded chroma (bink2 stream Cr,
+    //     written to display frame.v by the swapped blit at the call site).
+    //   - "v" parameters here are the SECOND-decoded chroma (bink2 stream Cb,
+    //     written to display frame.u). The SOVIET9 injection lives in
+    //     display U, so the "v" path is the suspect.
+    Bk2DumpChromaInit();
+    if (g_bk2_dump_iib_chroma && Bk2DumpChromaMatch()) {
+        const int fi = g_dbg_luma_frame_idx;
+        const int rr = g_dbg_chroma_mb_row, cc = g_dbg_chroma_mb_col;
+        std::fprintf(stderr,
+            "IIB_BEGIN f=%d r=%d c=%d intra_q=%d mb_flags=0x%x "
+            "u_cbp=0x%x v_cbp=0x%x\n",
+            fi, rr, cc, (int)intra_q, (unsigned)mb_flags,
+            (unsigned)out_mb.probe.u_cbp, (unsigned)out_mb.probe.v_cbp);
+        auto dump4 = [&](const char* tag, const std::array<int32_t, 4>& v) {
+            std::fprintf(stderr, "%s f=%d r=%d c=%d v=%d,%d,%d,%d\n",
+                         tag, fi, rr, cc, v[0], v[1], v[2], v[3]);
+        };
+        dump4("IIB_LU", left_u_dc);
+        dump4("IIB_TU", top_u_dc);
+        dump4("IIB_LTU", top_left_u_dc);
+        dump4("IIB_LV", left_v_dc);
+        dump4("IIB_TV", top_v_dc);
+        dump4("IIB_LTV", top_left_v_dc);
+        dump4("IIB_OUT_U_DC", out_u_dc);
+        dump4("IIB_OUT_V_DC", out_v_dc);
+        // mb.pixels.u / mb.pixels.v are the in-MB 16x16 reconstructions.
+        // The blit at the call site swaps them: pixels.u → frame.v;
+        // pixels.v → frame.u (display U).
+        auto dump_tile = [&](const char* tag, const uint8_t* p) {
+            std::fprintf(stderr, "%s f=%d r=%d c=%d 16x16=", tag, fi, rr, cc);
+            for (int y = 0; y < 16; ++y)
+                for (int x = 0; x < 16; ++x)
+                    std::fprintf(stderr, "%u%s", (unsigned)p[y * 16 + x],
+                                 (y == 15 && x == 15) ? "\n" : ",");
+        };
+        dump_tile("IIB_PIX_U", out_mb.pixels.u.data());
+        dump_tile("IIB_PIX_V", out_mb.pixels.v.data());
+    }
+
     return true;
 }
 
@@ -3408,7 +3458,8 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
     if (g_bk2_dump_luma_residue_enable || g_bk2_dump_luma_mc_enable
         || g_bk2_dump_luma_mc_src_enable || g_bk2_dump_chroma_residue_enable
         || g_bk2_dump_chroma_dc_decode == 1
-        || g_bk2_dump_frame_end_chroma || g_bk2_dump_chroma_copyprev) {
+        || g_bk2_dump_frame_end_chroma || g_bk2_dump_chroma_copyprev
+        || g_bk2_dump_iib_chroma) {
         g_dbg_luma_frame_idx =
             g_bk2_dump_luma_interframe_counter.fetch_add(1) + 1;
     }
@@ -3922,6 +3973,11 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                                                : prev_row_dc_a[col];
 
                     Bink2DecodedMacroblock mb = {};
+                    // M9.25: set chroma sidecar coords so IIB dump hook can
+                    // emit them. Parent does not otherwise set these on the
+                    // INTRA path.
+                    g_dbg_chroma_mb_col = (int)col;
+                    g_dbg_chroma_mb_row = (int)frame_row;
                     if (!DecodeAndReconstructIntraInInter(
                             bits, plan.packet.frame_flags, mb_flags, intra_q,
                             Bink2EffectiveHasAlpha(header, plan.packet.frame_flags),
