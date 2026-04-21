@@ -349,6 +349,18 @@ bool DecodeVlcLittleEndian(Bink2BitReader& bits,
     return false;
 }
 
+// AC coefficient dump state (BK2_DUMP_AC_COEFS). Caller sets
+// g_dbg_ac_active before each DecodeAcBlocks call; the sidecar
+// g_dbg_luma_{frame,row,col}_idx defined further down are also used.
+// Declared here (above the first use) to keep linkage simple — the
+// definitions near line ~2770 are moved up into this block.
+static int g_dbg_ac_active = 0;
+static int g_dbg_ac_group = 0;
+static int g_dbg_luma_frame_idx = 0;
+static int g_dbg_luma_mb_row = 0;
+static int g_dbg_luma_mb_col = 0;
+static const char* g_dbg_luma_plane_tag = "Y";
+
 bool DecodeAcBlocks(Bink2BitReader& bits,
                     uint32_t cbp,
                     int32_t q,
@@ -408,10 +420,21 @@ bool DecodeAcBlocks(Bink2BitReader& bits,
             if (sign != 0) coeff = -coeff;
 
             const uint8_t scan_idx = kBink2gScan[idx];
-            const int64_t dequant =
-                ((int64_t)coeff * (int64_t)qmat[q & 3][scan_idx] * (int64_t)q_scale + 64) >> 7;
+            const int64_t dequant_pre =
+                (int64_t)coeff * (int64_t)qmat[q & 3][scan_idx] * (int64_t)q_scale;
+            const int64_t dequant = (dequant_pre + 64) >> 7;
             blocks[block_index][scan_idx] =
                 (int16_t)ClipInt((int32_t)dequant, -32768, 32767);
+            if (g_dbg_ac_active) {
+                std::fprintf(stderr,
+                    "AC f=%d r=%d c=%d plane=%s g=%d b=%d idx=%d scan=%d "
+                    "raw=%d qmat=%u qshift=%d q3=%d preshift=%lld deq=%lld\n",
+                    g_dbg_luma_frame_idx, g_dbg_luma_mb_row, g_dbg_luma_mb_col,
+                    g_dbg_luma_plane_tag, g_dbg_ac_group, (int)block_index,
+                    (int)idx, (int)scan_idx, (int)coeff,
+                    (unsigned)qmat[q & 3][scan_idx], (int)(q >> 2), (int)(q & 3),
+                    (long long)dequant_pre, (long long)dequant);
+            }
             ++idx;
         }
     }
@@ -2133,6 +2156,21 @@ static inline bool Bk2Mc2dU16Temp() {
     }();
     return on;
 }
+// BK2_MC_LUMA_2D_I16_TEMP=1 switches 2D separable luma MC (mode==3) to keep
+// the H-pass numerator at full precision in int16 temp (no internal >>1,
+// no round, no clip) and apply one combined (+512)>>10 + Clip255 at V-end.
+// The legacy path uses u8 temp with two floor+clip rounds, which biases
+// +0.5..+1 LSB per call and accumulates on sub-pel MVs — see SOVIET9
+// f380..f450 walkback, the luma analogue of the chroma Bk2Mc2dU16Temp fix.
+// Default OFF while under A/B validation.
+static inline bool Bk2McLuma2dI16Temp() {
+    static const bool on = []{
+        const char* e = std::getenv("BK2_MC_LUMA_2D_I16_TEMP");
+        if (!e || !e[0]) return false;
+        return e[0] != '0';
+    }();
+    return on;
+}
 // MC sum-parity histogram. Populated by ChH/ChV when BK2_REPORT_MC_PARITY=1
 // is set; dumped by the dtor below. The quarter-pel sum 6a+2b is always
 // even, so only buckets {0,2,4,6} see non-zero counts — residents of
@@ -2522,12 +2560,19 @@ static inline int32_t LumaV(const uint8_t* s, int stride) {
             + (((int32_t)s[-2*stride]+s[3*stride]) >> 1) + 8) >> 4;
 }
 
+// M9.1 diag: defined near Bk2DumpLumaInit; forward-declared for LumaMc16.
+static int g_bk2_luma_mc_skip_mode[4];
+
 static void LumaMc16(uint8_t* dst, int stride,
                      const uint8_t* src, int sstride,
                      int width, int height,
                      int mv_x, int mv_y, int mode)
 {
     if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return;
+    // M9.1 diag: optionally substitute integer MC for a specific sub-pel mode
+    // to isolate which mode produces MC-path drift. Env-gated via
+    // BK2_LUMA_MC_SKIP_MODE{1,2,3}; defaults are 0 (no-op).
+    if (mode >= 1 && mode <= 3 && g_bk2_luma_mc_skip_mode[mode]) mode = 0;
     const uint8_t* msrc = src + mv_x + mv_y * sstride;
 
     if (mode == 0) {
@@ -2544,6 +2589,34 @@ static void LumaMc16(uint8_t* dst, int stride,
             for (int i = 0; i < 16; ++i) dst[i*stride] = Clip255(LumaV(msrc + i*sstride, sstride));
             dst  += 1;
             msrc += 1;
+        }
+    } else if (Bk2McLuma2dI16Temp()) {
+        // Full-precision H-pass numerator: 19*(a+b) - 4*(c+d) + (e+f).
+        // Equivalent to LumaH without the two internal floor-shifts and the
+        // final +8>>4 round+clip. Range fits int16: [-2040, 10200].
+        // V-pass combines on int16 with the same 6-tap weights; single
+        // combined shift+round+clip at the end: (sum + 512) >> 10.
+        int16_t temp[21 * 16];
+        msrc -= 2 * sstride;
+        for (int i = 0; i < 21; ++i) {
+            for (int j = 0; j < 16; ++j) {
+                const int32_t a = msrc[j] + msrc[j+1];
+                const int32_t c = msrc[j-1] + msrc[j+2];
+                const int32_t e = msrc[j-2] + msrc[j+3];
+                temp[i*16 + j] = (int16_t)(19*a - 4*c + e);
+            }
+            msrc += sstride;
+        }
+        for (int j = 0; j < 16; ++j) {
+            const int16_t* row = temp + (j+2)*16;
+            for (int i = 0; i < 16; ++i) {
+                const int32_t a = (int32_t)row[i]       + row[i +  16];
+                const int32_t c = (int32_t)row[i - 16]  + row[i + 2*16];
+                const int32_t e = (int32_t)row[i - 2*16]+ row[i + 3*16];
+                const int32_t s = 19*a - 4*c + e;
+                dst[i] = Clip255((s + 512) >> 10);
+            }
+            dst += stride;
         }
     } else {
         uint8_t temp[21 * 16];
@@ -2707,6 +2780,90 @@ static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
     g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
 }
 
+// ---- BK2_DUMP_INTER_LUMA_MB / BK2_DUMP_LUMA_MC diagnostic ----
+// Env-gated luma inter dumps for M5 SOVIET9 chroma-motion-bleed
+// classification (bink2-soviet9-chroma-motion-bleed.md). Independent
+// of BK2_MB_TRACE. Single per-call frame counter; sidecar coords set
+// by the slice loop around the luma calls. Not concurrency-safe.
+//   BK2_DUMP_INTER_LUMA_MB=1       dump dc/cbp/sub[b] pre-IDCT + dst
+//   BK2_DUMP_LUMA_MC=1             dump 32x32 MC tile at call site
+//   BK2_DUMP_INTER_LUMA_MB_FRAME=N  (1-indexed inter-frame; omit=all)
+//   BK2_DUMP_INTER_LUMA_MB_ROWS=r0:r1 / _COLS=c0:c1 (inclusive)
+//   BK2_DUMP_LUMA_MC_{FRAME,ROWS,COLS} fall back to the _MB triplet
+//   if not set, so a single filter can drive both dumps.
+static std::atomic<int> g_bk2_dump_luma_interframe_counter{0};
+static int g_bk2_dump_luma_residue_enable = -1;
+static int g_bk2_dump_luma_mc_enable = -1;
+static int g_bk2_dump_luma_mc_src_enable = 0;
+static int g_bk2_dump_ac_coefs_enable = -1;
+static int g_bk2_dump_luma_frame = -1;
+static int g_bk2_dump_luma_frame1 = -1;
+static int g_bk2_dump_luma_r0 = 0, g_bk2_dump_luma_r1 = 1 << 30;
+static int g_bk2_dump_luma_c0 = 0, g_bk2_dump_luma_c1 = 1 << 30;
+
+// M9.1 globals defined above LumaMc16 so the per-mode skip check compiles;
+// init is in Bk2DumpLumaInit below.
+
+// g_dbg_luma_{frame_idx,mb_row,mb_col,plane_tag} moved above DecodeAcBlocks.
+
+static void Bk2DumpLumaInit()
+{
+    if (g_bk2_dump_luma_residue_enable != -1) return;
+    auto envb = [](const char* n){
+        const char* e = std::getenv(n);
+        return (e && e[0] && e[0] != '0') ? 1 : 0;
+    };
+    g_bk2_dump_luma_residue_enable = envb("BK2_DUMP_INTER_LUMA_MB");
+    g_bk2_dump_luma_mc_enable      = envb("BK2_DUMP_LUMA_MC");
+    g_bk2_dump_luma_mc_src_enable  = envb("BK2_DUMP_LUMA_MC_SRC");
+    g_bk2_dump_ac_coefs_enable     = envb("BK2_DUMP_AC_COEFS");
+    g_bk2_luma_mc_skip_mode[1] = envb("BK2_LUMA_MC_SKIP_MODE1");
+    g_bk2_luma_mc_skip_mode[2] = envb("BK2_LUMA_MC_SKIP_MODE2");
+    g_bk2_luma_mc_skip_mode[3] = envb("BK2_LUMA_MC_SKIP_MODE3");
+    if (!g_bk2_dump_luma_residue_enable && !g_bk2_dump_luma_mc_enable
+        && !g_bk2_dump_luma_mc_src_enable && !g_bk2_dump_ac_coefs_enable) return;
+    const char* f = std::getenv("BK2_DUMP_INTER_LUMA_MB_FRAME");
+    if (!f) f = std::getenv("BK2_DUMP_LUMA_MC_FRAME");
+    if (f) {
+        int a = -1, b = -1;
+        int n = std::sscanf(f, "%d:%d", &a, &b);
+        g_bk2_dump_luma_frame = a;
+        g_bk2_dump_luma_frame1 = (n == 2) ? b : a;
+    }
+    const char* r = std::getenv("BK2_DUMP_INTER_LUMA_MB_ROWS");
+    if (!r) r = std::getenv("BK2_DUMP_LUMA_MC_ROWS");
+    if (r) std::sscanf(r, "%d:%d", &g_bk2_dump_luma_r0, &g_bk2_dump_luma_r1);
+    const char* c = std::getenv("BK2_DUMP_INTER_LUMA_MB_COLS");
+    if (!c) c = std::getenv("BK2_DUMP_LUMA_MC_COLS");
+    if (c) std::sscanf(c, "%d:%d", &g_bk2_dump_luma_c0, &g_bk2_dump_luma_c1);
+}
+
+static bool Bk2DumpLumaMatch()
+{
+    if (g_bk2_dump_luma_frame >= 0 &&
+        (g_dbg_luma_frame_idx < g_bk2_dump_luma_frame ||
+         g_dbg_luma_frame_idx > g_bk2_dump_luma_frame1)) return false;
+    if (g_dbg_luma_mb_row < g_bk2_dump_luma_r0 ||
+        g_dbg_luma_mb_row > g_bk2_dump_luma_r1) return false;
+    if (g_dbg_luma_mb_col < g_bk2_dump_luma_c0 ||
+        g_dbg_luma_mb_col > g_bk2_dump_luma_c1) return false;
+    return true;
+}
+
+static void Bk2DumpLumaTile32(const char* tag, const uint8_t* dst, int stride)
+{
+    std::fprintf(stderr, "%s f=%d r=%d c=%d plane=%s 32x32=",
+                 tag, g_dbg_luma_frame_idx,
+                 g_dbg_luma_mb_row, g_dbg_luma_mb_col, g_dbg_luma_plane_tag);
+    for (int y = 0; y < 32; ++y) {
+        for (int x = 0; x < 32; ++x) {
+            std::fprintf(stderr, "%u%s",
+                         (unsigned)dst[y * stride + x],
+                         (y == 31 && x == 31) ? "\n" : ",");
+        }
+    }
+}
+
 // Decode an inter luma plane and ADD its residual into dst[32x32 region].
 static bool DecodeAndAddInterLumaPlane(Bink2BitReader& bits,
                                        uint32_t frame_flags,
@@ -2724,18 +2881,62 @@ static bool DecodeAndAddInterLumaPlane(Bink2BitReader& bits,
                             zero16, zero16, zero16, dc)) return false;
 
     std::array<std::array<int16_t, 64>, 4> sub = {};
+    // Diagnostic: BK2_SKIP_LUMA_RESIDUAL=1 consumes bits but skips the
+    // IDCT-add for the inter luma path, isolating residue contribution
+    // from the MC / copy-prev seed (M4 for SOVIET9 chroma-bleed task).
+    static const bool skip_luma_residual = []{
+        const char* e = std::getenv("BK2_SKIP_LUMA_RESIDUAL");
+        return e && e[0] && e[0] != '0';
+    }();
+    Bk2DumpLumaInit();
+    const bool dump_luma =
+        g_bk2_dump_luma_residue_enable && dst && Bk2DumpLumaMatch();
+    if (dump_luma) {
+        std::fprintf(stderr,
+            "LUMA_MB_BEGIN f=%d r=%d c=%d plane=%s q=%d cbp=0x%x\n",
+            g_dbg_luma_frame_idx, g_dbg_luma_mb_row, g_dbg_luma_mb_col,
+            g_dbg_luma_plane_tag, (int)inter_q, (unsigned)cbp);
+        std::fprintf(stderr, "LUMA_MB_DC f=%d r=%d c=%d dc=",
+                     g_dbg_luma_frame_idx, g_dbg_luma_mb_row, g_dbg_luma_mb_col);
+        for (int i = 0; i < 16; ++i) {
+            std::fprintf(stderr, "%d%s", dc[i], i == 15 ? "\n" : ",");
+        }
+        Bk2DumpLumaTile32("LUMA_MB_BASE", dst, stride);
+    }
+    const bool dump_ac =
+        g_bk2_dump_ac_coefs_enable && Bk2DumpLumaMatch();
     for (uint32_t g = 0; g < 4u; ++g) {
-        if (!DecodeAcBlocks(bits, cbp >> (g * 4u), inter_q,
-                            kBink2gInterQmat, sub)) return false;
+        g_dbg_ac_active = dump_ac ? 1 : 0;
+        g_dbg_ac_group = (int)g;
+        const bool ac_ok = DecodeAcBlocks(bits, cbp >> (g * 4u), inter_q,
+                                          kBink2gInterQmat, sub);
+        g_dbg_ac_active = 0;
+        if (!ac_ok) return false;
         if (!dst) continue;  // bitstream-only mode (e.g. alpha with no buffer)
+        if (skip_luma_residual) continue;
         for (uint32_t b = 0; b < 4u; ++b) {
             const uint32_t decoded_idx = g * 4u + b;
             sub[b][0] = (int16_t)(dc[decoded_idx] * 8 + 32);
+            if (dump_luma) {
+                std::fprintf(stderr,
+                    "LUMA_SUB f=%d r=%d c=%d g=%u b=%u idx=%u coeffs=",
+                    g_dbg_luma_frame_idx, g_dbg_luma_mb_row, g_dbg_luma_mb_col,
+                    (unsigned)g, (unsigned)b, (unsigned)decoded_idx);
+                for (int k = 0; k < 64; ++k) {
+                    std::fprintf(stderr, "%d%s",
+                                 (int)sub[b][k], k == 63 ? "\n" : ",");
+                }
+            }
             const uint8_t spatial = kLumaRepos[decoded_idx];
             const int block_x = (spatial & 3) * 8;
             const int block_y = (spatial >> 2) * 8;
             Bink2gIdctAdd(dst + block_y * stride + block_x, stride, sub[b].data());
         }
+    }
+    if (dump_luma) {
+        Bk2DumpLumaTile32("LUMA_MB_POST", dst, stride);
+        std::fprintf(stderr, "LUMA_MB_END f=%d r=%d c=%d\n",
+                     g_dbg_luma_frame_idx, g_dbg_luma_mb_row, g_dbg_luma_mb_col);
     }
     return true;
 }
@@ -3036,6 +3237,13 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
         g_bk2_mbtrace_enable &&
         (g_bk2_mbtrace_frame < 0 || g_bk2_mbtrace_frame == bk2_trace_frame_idx);
 
+    Bk2DumpLumaInit();
+    if (g_bk2_dump_luma_residue_enable || g_bk2_dump_luma_mc_enable
+        || g_bk2_dump_luma_mc_src_enable) {
+        g_dbg_luma_frame_idx =
+            g_bk2_dump_luma_interframe_counter.fetch_add(1) + 1;
+    }
+
     if (!header.Is_Valid()) return false;
     if (packet.empty()) return false;
     if (plan.packet.num_slices == 0u) return false;
@@ -3219,6 +3427,71 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                                      frame.y.data(), frame.luma_stride,
                                      prev_frame.y.data(), prev_frame.luma_stride,
                                      mc_w, mc_h);
+                    if (g_bk2_dump_luma_mc_src_enable) {
+                        g_dbg_luma_mb_row = (int)frame_row;
+                        g_dbg_luma_mb_col = (int)col;
+                        g_dbg_luma_plane_tag = "Y";
+                        if (Bk2DumpLumaMatch()) {
+                            for (int k = 0; k < 4; ++k) {
+                                const int sub_x = (k & 1) * 16;
+                                const int sub_y = (k >> 1) * 16;
+                                const int sp_mv_x = ((int)absolute_mv.v[k][0] >> 1) + (int)y_x + sub_x;
+                                const int sp_mv_y = ((int)absolute_mv.v[k][1] >> 1) + (int)y_y + sub_y;
+                                const int sp_mode = ((int)absolute_mv.v[k][0] & 1) | (((int)absolute_mv.v[k][1] & 1) << 1);
+                                if (sp_mv_x < 0 || sp_mv_x >= mc_w || sp_mv_y < 0 || sp_mv_y >= mc_h) continue;
+                                std::fprintf(stderr,
+                                    "LUMA_MC_SRC f=%d r=%u c=%u k=%d mode=%d mv_x=%d mv_y=%d raw_mv=%d,%d 21x21=",
+                                    g_dbg_luma_frame_idx, (unsigned)frame_row, (unsigned)col,
+                                    k, sp_mode, sp_mv_x, sp_mv_y,
+                                    (int)absolute_mv.v[k][0], (int)absolute_mv.v[k][1]);
+                                for (int jj = -2; jj < 19; ++jj) {
+                                    for (int ii = -2; ii < 19; ++ii) {
+                                        const int sy = sp_mv_y + jj;
+                                        const int sx = sp_mv_x + ii;
+                                        const int cy = sy < 0 ? 0 : (sy >= mc_h ? mc_h - 1 : sy);
+                                        const int cx = sx < 0 ? 0 : (sx >= mc_w ? mc_w - 1 : sx);
+                                        std::fprintf(stderr, "%s%u",
+                                            (ii == -2 && jj == -2) ? "" : ",",
+                                            (unsigned)prev_frame.y[cy * (int)prev_frame.luma_stride + cx]);
+                                    }
+                                }
+                                std::fprintf(stderr, "\n");
+                                const uint8_t* sub_dst = frame.y.data()
+                                    + ((int)y_y + sub_y) * (int)frame.luma_stride
+                                    + (int)y_x + sub_x;
+                                std::fprintf(stderr,
+                                    "LUMA_MC_OUT f=%d r=%u c=%u k=%d 16x16=",
+                                    g_dbg_luma_frame_idx, (unsigned)frame_row, (unsigned)col, k);
+                                for (int jj = 0; jj < 16; ++jj) {
+                                    for (int ii = 0; ii < 16; ++ii) {
+                                        std::fprintf(stderr, "%s%u",
+                                            (ii == 0 && jj == 0) ? "" : ",",
+                                            (unsigned)sub_dst[jj * (int)frame.luma_stride + ii]);
+                                    }
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    if (g_bk2_dump_luma_mc_enable) {
+                        g_dbg_luma_mb_row = (int)frame_row;
+                        g_dbg_luma_mb_col = (int)col;
+                        g_dbg_luma_plane_tag = "Y";
+                        if (Bk2DumpLumaMatch()) {
+                            std::fprintf(stderr,
+                                "LUMA_MC_MV f=%d r=%u c=%u mv=[%d,%d|%d,%d|%d,%d|%d,%d]\n",
+                                g_dbg_luma_frame_idx,
+                                (unsigned)frame_row, (unsigned)col,
+                                (int)absolute_mv.v[0][0], (int)absolute_mv.v[0][1],
+                                (int)absolute_mv.v[1][0], (int)absolute_mv.v[1][1],
+                                (int)absolute_mv.v[2][0], (int)absolute_mv.v[2][1],
+                                (int)absolute_mv.v[3][0], (int)absolute_mv.v[3][1]);
+                            Bk2DumpLumaTile32(
+                                "LUMA_MC",
+                                frame.y.data() + y_y * frame.luma_stride + y_x,
+                                (int)frame.luma_stride);
+                        }
+                    }
                     // Diagnostic: BK2_SKIP_CHROMA_MC=1 leaves chroma seeded
                     // by CopyPrevFrameMacroblock (pure passthrough at MB
                     // position 0,0) and skips the 1/4-pel filter — isolates
@@ -3513,6 +3786,9 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                             ? frame.a.data() + y_y * frame.luma_stride + y_x
                             : nullptr;
 
+                    g_dbg_luma_mb_row = (int)frame_row;
+                    g_dbg_luma_mb_col = (int)col;
+                    g_dbg_luma_plane_tag = "Y";
                     if (!DecodeAndAddInterLumaPlane(bits, plan.packet.frame_flags,
                                                     y_cbp_inter, inter_q,
                                                     y_dst, (int)frame.luma_stride)) {
@@ -3547,6 +3823,9 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                     }
 
                     if (Bink2EffectiveHasAlpha(header, plan.packet.frame_flags)) {
+                        g_dbg_luma_mb_row = (int)frame_row;
+                        g_dbg_luma_mb_col = (int)col;
+                        g_dbg_luma_plane_tag = "A";
                         if (!DecodeAndAddInterLumaPlane(bits, plan.packet.frame_flags,
                                                          a_cbp_inter, inter_q,
                                                          a_dst, (int)frame.luma_stride)) {
