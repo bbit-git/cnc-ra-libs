@@ -2935,13 +2935,29 @@ static int g_bk2_dump_chroma_frame = -1;
 static int g_bk2_dump_chroma_frame1 = -1;
 static int g_bk2_dump_chroma_r0 = 0, g_bk2_dump_chroma_r1 = 1 << 30;
 static int g_bk2_dump_chroma_c0 = 0, g_bk2_dump_chroma_c1 = 1 << 30;
+// M9.24: two additional dump gates that reuse the filter above.
+//   BK2_DUMP_FRAME_END_CHROMA_MB=1  dumps 16x16 U/V tiles right before
+//     Bink2DecodeInterFrameSkipPrefix returns (after the full slice loop).
+//   BK2_DUMP_CHROMA_COPYPREV=1      dumps 16x16 U/V tiles right after the
+//     CopyPrevFrameMacroblock call (SKIP/MOTION/RESIDUE seed stage).
+// Both share BK2_DUMP_INTER_CHROMA_MB_{FRAME,ROWS,COLS} for filtering.
+// The inter-frame counter must be enabled independently of
+// BK2_DUMP_INTER_CHROMA_MB so either hook works in isolation.
+static int g_bk2_dump_frame_end_chroma = -1;
+static int g_bk2_dump_chroma_copyprev = -1;
 
 static void Bk2DumpChromaInit()
 {
     if (g_bk2_dump_chroma_residue_enable != -1) return;
     const char* e = std::getenv("BK2_DUMP_INTER_CHROMA_MB");
     g_bk2_dump_chroma_residue_enable = (e && e[0] && e[0] != '0') ? 1 : 0;
-    if (!g_bk2_dump_chroma_residue_enable) return;
+    const char* efe = std::getenv("BK2_DUMP_FRAME_END_CHROMA_MB");
+    g_bk2_dump_frame_end_chroma = (efe && efe[0] && efe[0] != '0') ? 1 : 0;
+    const char* ecp = std::getenv("BK2_DUMP_CHROMA_COPYPREV");
+    g_bk2_dump_chroma_copyprev = (ecp && ecp[0] && ecp[0] != '0') ? 1 : 0;
+    if (!g_bk2_dump_chroma_residue_enable &&
+        !g_bk2_dump_frame_end_chroma &&
+        !g_bk2_dump_chroma_copyprev) return;
     const char* f = std::getenv("BK2_DUMP_INTER_CHROMA_MB_FRAME");
     if (f) {
         int a = -1, b = -1;
@@ -3391,7 +3407,8 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
     Bk2DumpChromaDcInit();
     if (g_bk2_dump_luma_residue_enable || g_bk2_dump_luma_mc_enable
         || g_bk2_dump_luma_mc_src_enable || g_bk2_dump_chroma_residue_enable
-        || g_bk2_dump_chroma_dc_decode == 1) {
+        || g_bk2_dump_chroma_dc_decode == 1
+        || g_bk2_dump_frame_end_chroma || g_bk2_dump_chroma_copyprev) {
         g_dbg_luma_frame_idx =
             g_bk2_dump_luma_interframe_counter.fetch_add(1) + 1;
     }
@@ -3561,6 +3578,38 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
                 // overwrites with MC then adds residual).
                 if (type != kBink2BlockIntra) {
                     CopyPrevFrameMacroblock(prev_frame, frame, col, frame_row);
+                    // M9.24: dump the seeded chroma tile right after
+                    // CopyPrevFrameMacroblock so the SKIP/MOTION handoff is
+                    // visible. The copy is a raw memcpy, so this tile should
+                    // exactly equal prev_frame at the same MB position.
+                    Bk2DumpChromaInit();
+                    if (g_bk2_dump_chroma_copyprev) {
+                        g_dbg_chroma_mb_col = (int)col;
+                        g_dbg_chroma_mb_row = (int)frame_row;
+                        if (Bk2DumpChromaMatch()) {
+                            const uint32_t uv_x = col * 16u;
+                            const uint32_t uv_y = frame_row * 16u;
+                            const int cs = (int)frame.chroma_stride;
+                            std::fprintf(stderr,
+                                "CHROMA_MB_COPYPREV_TYPE f=%d r=%d c=%d type=%d\n",
+                                g_dbg_luma_frame_idx, (int)frame_row, (int)col, (int)type);
+                            g_dbg_chroma_mb_plane = 'U';
+                            Bk2DumpChromaTile16("CHROMA_MB_COPYPREV",
+                                frame.u.data() + uv_y * cs + uv_x, cs);
+                            g_dbg_chroma_mb_plane = 'V';
+                            Bk2DumpChromaTile16("CHROMA_MB_COPYPREV",
+                                frame.v.data() + uv_y * cs + uv_x, cs);
+                            // Source (prev) tile for comparison.
+                            g_dbg_chroma_mb_plane = 'U';
+                            Bk2DumpChromaTile16("CHROMA_MB_PREV_SRC",
+                                prev_frame.u.data() + uv_y * prev_frame.chroma_stride + uv_x,
+                                (int)prev_frame.chroma_stride);
+                            g_dbg_chroma_mb_plane = 'V';
+                            Bk2DumpChromaTile16("CHROMA_MB_PREV_SRC",
+                                prev_frame.v.data() + uv_y * prev_frame.chroma_stride + uv_x,
+                                (int)prev_frame.chroma_stride);
+                        }
+                    }
                 }
 
                 if (type == kBink2BlockMotion || type == kBink2BlockResidue) {
@@ -4057,6 +4106,38 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
     frame.bit_offset_end = bits.Bits_Read();
     frame.complete = !stopped &&
                      frame.decoded_slice_count == plan.packet.num_slices;
+
+    // M9.24: post-slice-loop frame-end chroma dump. Emits 16x16 U/V tiles
+    // at the filtered MB(s) right before we return the frame to the caller.
+    // Compared against CHROMA_MB_POST (emitted inside
+    // DecodeAndAddInterChromaPlane) this localizes any injection stage that
+    // happens AFTER per-MB residue decode but BEFORE YUVA readback.
+    Bk2DumpChromaInit();
+    if (g_bk2_dump_frame_end_chroma &&
+        (g_bk2_dump_chroma_frame < 0 ||
+         (g_dbg_luma_frame_idx >= g_bk2_dump_chroma_frame &&
+          g_dbg_luma_frame_idx <= g_bk2_dump_chroma_frame1))) {
+        const int cs = (int)frame.chroma_stride;
+        const int cmb_rows = (int)frame.macroblock_rows;
+        const int cmb_cols = (int)frame.macroblock_cols;
+        for (int r = g_bk2_dump_chroma_r0; r <= g_bk2_dump_chroma_r1 && r < cmb_rows; ++r) {
+            if (r < 0) continue;
+            for (int c = g_bk2_dump_chroma_c0; c <= g_bk2_dump_chroma_c1 && c < cmb_cols; ++c) {
+                if (c < 0) continue;
+                const uint32_t uv_x = (uint32_t)c * 16u;
+                const uint32_t uv_y = (uint32_t)r * 16u;
+                g_dbg_chroma_mb_col = c;
+                g_dbg_chroma_mb_row = r;
+                g_dbg_chroma_mb_plane = 'U';
+                Bk2DumpChromaTile16("FRAME_END_CHROMA_MB",
+                    frame.u.data() + uv_y * cs + uv_x, cs);
+                g_dbg_chroma_mb_plane = 'V';
+                Bk2DumpChromaTile16("FRAME_END_CHROMA_MB",
+                    frame.v.data() + uv_y * cs + uv_x, cs);
+            }
+        }
+    }
+
     return true;
 }
 
