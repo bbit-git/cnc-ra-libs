@@ -360,6 +360,18 @@ static int g_dbg_luma_frame_idx = 0;
 static int g_dbg_luma_mb_row = 0;
 static int g_dbg_luma_mb_col = 0;
 static const char* g_dbg_luma_plane_tag = "Y";
+// Chroma-side sidecars moved up alongside the luma ones so DecodeDcValues
+// (defined ~line 810) can reference them. Set by the slice loop around
+// each DecodeAndAddInterChromaPlane call.
+static int  g_dbg_chroma_mb_col = 0;
+static int  g_dbg_chroma_mb_row = 0;
+static char g_dbg_chroma_mb_plane = 'U';
+// M9.11: BK2_DUMP_CHROMA_DC_DECODE=1 emits per-MB per-subblock DC decode
+// trace (has_delta, unary, delta, tdc, dst). FRAME/ROWS/COLS filters reuse
+// the BK2_DUMP_INTER_CHROMA_MB gate. Purpose: detect any U/V asymmetry in
+// the raw bitstream DC deltas feeding the V-plane bias (SOVIET9 chroma
+// motion bleed — see docs/tasks/bink2-soviet9-chroma-motion-bleed.md).
+static int g_bk2_dump_chroma_dc_decode = -1;
 
 bool DecodeAcBlocks(Bink2BitReader& bits,
                     uint32_t cbp,
@@ -807,6 +819,16 @@ int32_t PredictIntraQ(int8_t left_q, int8_t top_q, int8_t top_left_q, int32_t dq
     return MidPred(top_q, left_q, top_left_q) + dq;
 }
 
+// M9.11 instrumentation helpers. The filter reuses the
+// BK2_DUMP_INTER_CHROMA_MB_{FRAME,ROWS,COLS} env vars so a single capture
+// run can collect both the MB tile dumps and the DC decode trace.
+static void Bk2DumpChromaDcInit()
+{
+    if (g_bk2_dump_chroma_dc_decode != -1) return;
+    const char* e = std::getenv("BK2_DUMP_CHROMA_DC_DECODE");
+    g_bk2_dump_chroma_dc_decode = (e && e[0] && e[0] != '0') ? 1 : 0;
+}
+
 template <size_t N>
 bool DecodeDcValues(Bink2BitReader& bits,
                     int32_t q,
@@ -829,8 +851,15 @@ bool DecodeDcValues(Bink2BitReader& bits,
     if ((is_luma && N != 16u) || (!is_luma && N != 4u)) return false;
     std::array<int32_t, 16> tdc = {};
 
+    Bk2DumpChromaDcInit();
+    const bool dump_dc = !is_luma && g_bk2_dump_chroma_dc_decode == 1;
+
     uint32_t has_delta = 0;
     if (!bits.Read_Bit(has_delta)) return false;
+    // dc_trace holds (unary, delta, tdc) per sub-block for the optional
+    // post-decode dump. Size 16 covers both luma and chroma counts.
+    uint32_t dc_trace_unary[16] = {};
+    int32_t  dc_trace_delta[16] = {};
     if (has_delta != 0) {
         for (size_t i = 0; i < count; ++i) {
             uint32_t unary = 0;
@@ -850,6 +879,10 @@ bool DecodeDcValues(Bink2BitReader& bits,
             }
 
             tdc[i] = (delta * pat + 0x200) >> 10;
+            if (dump_dc) {
+                dc_trace_unary[i] = unary;
+                dc_trace_delta[i] = delta;
+            }
         }
     }
 
@@ -941,6 +974,23 @@ bool DecodeDcValues(Bink2BitReader& bits,
         dst[1] = ClipInt(DCMpred(top_dc[2], dst[0], top_dc[3]) + tdc[1], min_dc, max_dc);
         dst[2] = ClipInt(DCMpred(left_dc[1], left_dc[3], dst[0]) + tdc[2], min_dc, max_dc);
         dst[3] = ClipInt(DCMpred(dst[0], dst[2], dst[1]) + tdc[3], min_dc, max_dc);
+    }
+
+    if (dump_dc) {
+        std::fprintf(stderr,
+            "CHROMA_DC_DECODE f=%d r=%d c=%d plane=%c q=%d flags=0x%x "
+            "has_delta=%u pat=%d\n",
+            g_dbg_luma_frame_idx, g_dbg_chroma_mb_row, g_dbg_chroma_mb_col,
+            g_dbg_chroma_mb_plane, (int)q, (unsigned)flags,
+            (unsigned)has_delta, (int)pat);
+        for (size_t i = 0; i < count; ++i) {
+            std::fprintf(stderr,
+                "CHROMA_DC_SUB f=%d r=%d c=%d plane=%c i=%u unary=%u delta=%d tdc=%d dst=%d\n",
+                g_dbg_luma_frame_idx, g_dbg_chroma_mb_row, g_dbg_chroma_mb_col,
+                g_dbg_chroma_mb_plane, (unsigned)i,
+                (unsigned)dc_trace_unary[i], (int)dc_trace_delta[i],
+                (int)tdc[i], (int)dst[i]);
+        }
     }
 
     return true;
@@ -2867,9 +2917,7 @@ static void Bk2DumpLumaTile32(const char* tag, const uint8_t* dst, int stride)
 // Chroma MB sidecar globals (moved above their original location
 // near DecodeAndAddInterChromaPlane so the chroma dump helpers can
 // reference them). The slice loop sets these before each call.
-static int  g_dbg_chroma_mb_col = 0;
-static int  g_dbg_chroma_mb_row = 0;
-static char g_dbg_chroma_mb_plane = 'U';
+// (Definitions moved up to ~line 363 so DecodeDcValues can reference them.)
 
 // ---- BK2_DUMP_INTER_CHROMA_MB diagnostic ----
 // Mirror of the luma dump hook for the chroma inter path. Emits
@@ -3340,8 +3388,10 @@ bool Bink2DecodeInterFrameSkipPrefix(const Bink2Header& header,
 
     Bk2DumpLumaInit();
     Bk2DumpChromaInit();
+    Bk2DumpChromaDcInit();
     if (g_bk2_dump_luma_residue_enable || g_bk2_dump_luma_mc_enable
-        || g_bk2_dump_luma_mc_src_enable || g_bk2_dump_chroma_residue_enable) {
+        || g_bk2_dump_luma_mc_src_enable || g_bk2_dump_chroma_residue_enable
+        || g_bk2_dump_chroma_dc_decode == 1) {
         g_dbg_luma_frame_idx =
             g_bk2_dump_luma_interframe_counter.fetch_add(1) + 1;
     }
