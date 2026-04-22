@@ -13,6 +13,14 @@
 #include <cstdlib>
 #include <cstring>
 
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && \
+    (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define BK2_HAVE_SSE2 1
+#include <emmintrin.h>
+#else
+#define BK2_HAVE_SSE2 0
+#endif
+
 namespace {
 
 static const uint8_t kBink2gChromaCbpPat[16] = {
@@ -272,9 +280,12 @@ static bool Bk2SimdIdctRequested()
 
 static bool Bk2SimdMotionCompActive()
 {
-    // Phase 1 wires the gate/dispatch surface but keeps scalar active until
-    // SIMD kernels land.
-    return false;
+    return Bk2SimdMotionCompRequested() &&
+#if BK2_HAVE_SSE2
+           true;
+#else
+           false;
+#endif
 }
 
 static bool Bk2SimdIdctActive()
@@ -2485,6 +2496,249 @@ static inline bool Bk2McClampMv() {
     return on;
 }
 
+#if BK2_HAVE_SSE2
+static inline __m128i Bk2Load8To16(const uint8_t* src)
+{
+    return _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)src),
+                             _mm_setzero_si128());
+}
+
+static inline void Bk2Load16To16(const uint8_t* src, __m128i& lo, __m128i& hi)
+{
+    const __m128i bytes = _mm_loadu_si128((const __m128i*)src);
+    const __m128i zero = _mm_setzero_si128();
+    lo = _mm_unpacklo_epi8(bytes, zero);
+    hi = _mm_unpackhi_epi8(bytes, zero);
+}
+
+static inline void Bk2Store8From16(uint8_t* dst, __m128i values)
+{
+    const __m128i packed = _mm_packus_epi16(values, _mm_setzero_si128());
+    _mm_storel_epi64((__m128i*)dst, packed);
+}
+
+static inline void Bk2Store16From16(uint8_t* dst, __m128i lo, __m128i hi)
+{
+    const __m128i packed = _mm_packus_epi16(lo, hi);
+    _mm_storeu_si128((__m128i*)dst, packed);
+}
+
+static inline __m128i Bk2RoundShift16(__m128i sum, int shift, int round_mode)
+{
+    if (shift <= 0) return sum;
+
+    const int rounder = 1 << (shift - 1);
+    if (round_mode == 1) {
+        return _mm_srli_epi16(_mm_add_epi16(sum,
+                                            _mm_set1_epi16((short)(rounder - 1))),
+                              shift);
+    }
+    if (round_mode == 2) {
+        const __m128i ties = _mm_and_si128(_mm_srli_epi16(sum, shift),
+                                           _mm_set1_epi16(1));
+        return _mm_srli_epi16(
+            _mm_add_epi16(_mm_add_epi16(sum,
+                                        _mm_set1_epi16((short)(rounder - 1))),
+                          ties),
+            shift);
+    }
+    return _mm_srli_epi16(_mm_add_epi16(sum, _mm_set1_epi16((short)rounder)),
+                          shift);
+}
+
+static inline __m128i Bk2ChromaWeighted16(__m128i a, __m128i b, int mode)
+{
+    if (mode == 1) {
+        return _mm_add_epi16(
+            _mm_add_epi16(_mm_slli_epi16(a, 2), _mm_slli_epi16(a, 1)),
+            _mm_slli_epi16(b, 1));
+    }
+    if (mode == 2) {
+        return _mm_add_epi16(a, b);
+    }
+    return _mm_add_epi16(
+        _mm_slli_epi16(a, 1),
+        _mm_add_epi16(_mm_slli_epi16(b, 2), _mm_slli_epi16(b, 1)));
+}
+
+static inline __m128i Bk2ChromaFiltered16(__m128i a, __m128i b, int mode,
+                                          int halfpel_mode,
+                                          int quarterpel_mode)
+{
+    const __m128i raw = Bk2ChromaWeighted16(a, b, mode);
+    if (mode == 2) return Bk2RoundShift16(raw, 1, halfpel_mode);
+    return Bk2RoundShift16(raw, 3, quarterpel_mode);
+}
+
+static inline __m128i Bk2LumaRounded16(__m128i m2, __m128i m1,
+                                       __m128i p0, __m128i p1,
+                                       __m128i p2, __m128i p3)
+{
+    const __m128i ab = _mm_add_epi16(p0, p1);
+    const __m128i cd = _mm_add_epi16(m1, p2);
+    const __m128i ef = _mm_add_epi16(m2, p3);
+    const __m128i term1 = _mm_srli_epi16(_mm_mullo_epi16(ab, _mm_set1_epi16(19)),
+                                         1);
+    const __m128i term2 = _mm_slli_epi16(cd, 1);
+    const __m128i term3 = _mm_srli_epi16(ef, 1);
+    const __m128i sum =
+        _mm_add_epi16(_mm_sub_epi16(term1, term2),
+                      _mm_add_epi16(term3, _mm_set1_epi16(8)));
+    return _mm_srai_epi16(sum, 4);
+}
+
+static inline __m128i Bk2LumaRaw16(__m128i m2, __m128i m1,
+                                   __m128i p0, __m128i p1,
+                                   __m128i p2, __m128i p3)
+{
+    const __m128i ab = _mm_add_epi16(p0, p1);
+    const __m128i cd = _mm_add_epi16(m1, p2);
+    const __m128i ef = _mm_add_epi16(m2, p3);
+    return _mm_add_epi16(
+        _mm_sub_epi16(_mm_mullo_epi16(ab, _mm_set1_epi16(19)),
+                      _mm_slli_epi16(cd, 2)),
+        ef);
+}
+
+static inline __m128i Bk2SignExtendLo16(__m128i values)
+{
+    const __m128i sign = _mm_cmpgt_epi16(_mm_setzero_si128(), values);
+    return _mm_unpacklo_epi16(values, sign);
+}
+
+static inline __m128i Bk2SignExtendHi16(__m128i values)
+{
+    const __m128i sign = _mm_cmpgt_epi16(_mm_setzero_si128(), values);
+    return _mm_unpackhi_epi16(values, sign);
+}
+
+static inline __m128i Bk2Mul19_32(__m128i values)
+{
+    return _mm_add_epi32(_mm_add_epi32(_mm_slli_epi32(values, 4),
+                                       _mm_slli_epi32(values, 1)),
+                         values);
+}
+
+static inline __m128i Bk2LumaI16TempVertical32(__m128i r0, __m128i r1,
+                                               __m128i r2, __m128i r3,
+                                               __m128i r4, __m128i r5)
+{
+    const __m128i a = _mm_add_epi32(r2, r3);
+    const __m128i c = _mm_add_epi32(r1, r4);
+    const __m128i e = _mm_add_epi32(r0, r5);
+    const __m128i sum =
+        _mm_add_epi32(_mm_sub_epi32(Bk2Mul19_32(a), _mm_slli_epi32(c, 2)), e);
+    return _mm_srai_epi32(_mm_add_epi32(sum, _mm_set1_epi32(512)), 10);
+}
+
+static void ChromaMc8Simd(uint8_t* dst, int stride,
+                          const uint8_t* src, int sstride,
+                          int mv_x, int mv_y, int mode)
+{
+    const int h = mode & 3;
+    const int v = (mode >> 2) & 3;
+    const int halfpel_mode = Bk2McHalfpelRoundMode();
+    const int quarterpel_mode = Bk2McQuarterpelRoundMode();
+    const uint8_t* msrc = src + mv_x + mv_y * sstride;
+
+    if (h == 0 && v == 0) {
+        for (int j = 0; j < 8; ++j) {
+            _mm_storel_epi64((__m128i*)(dst + j * stride),
+                             _mm_loadl_epi64((const __m128i*)(msrc + j * sstride)));
+        }
+        return;
+    }
+
+    if (v == 0) {
+        for (int j = 0; j < 8; ++j) {
+            const __m128i a = Bk2Load8To16(msrc);
+            const __m128i b = Bk2Load8To16(msrc + 1);
+            Bk2Store8From16(dst, Bk2ChromaFiltered16(a, b, h,
+                                                     halfpel_mode,
+                                                     quarterpel_mode));
+            dst += stride;
+            msrc += sstride;
+        }
+        return;
+    }
+
+    if (h == 0) {
+        for (int j = 0; j < 8; ++j) {
+            const __m128i a = Bk2Load8To16(msrc);
+            const __m128i b = Bk2Load8To16(msrc + sstride);
+            Bk2Store8From16(dst, Bk2ChromaFiltered16(a, b, v,
+                                                     halfpel_mode,
+                                                     quarterpel_mode));
+            dst += stride;
+            msrc += sstride;
+        }
+        return;
+    }
+
+    __m128i temp[9];
+    if (Bk2Mc2dU16Temp()) {
+        for (int i = 0; i < 9; ++i) {
+            temp[i] = Bk2ChromaWeighted16(Bk2Load8To16(msrc),
+                                          Bk2Load8To16(msrc + 1),
+                                          h);
+            msrc += sstride;
+        }
+
+        const int h_den = (h == 2) ? 2 : 8;
+        const int v_den = (v == 2) ? 2 : 8;
+        const int shift = (h_den == 8 || v_den == 8)
+            ? ((h_den == 8 && v_den == 8) ? 6 : 4)
+            : 2;
+        const int round_mode = (h_den == 8 || v_den == 8)
+            ? quarterpel_mode
+            : halfpel_mode;
+        for (int j = 0; j < 8; ++j) {
+            const __m128i sum = Bk2ChromaWeighted16(temp[j], temp[j + 1], v);
+            Bk2Store8From16(dst, Bk2RoundShift16(sum, shift, round_mode));
+            dst += stride;
+        }
+        return;
+    }
+
+    for (int i = 0; i < 9; ++i) {
+        temp[i] = Bk2ChromaFiltered16(Bk2Load8To16(msrc),
+                                      Bk2Load8To16(msrc + 1),
+                                      h,
+                                      halfpel_mode,
+                                      quarterpel_mode);
+        msrc += sstride;
+    }
+    for (int j = 0; j < 8; ++j) {
+        Bk2Store8From16(dst, Bk2ChromaFiltered16(temp[j], temp[j + 1], v,
+                                                 halfpel_mode,
+                                                 quarterpel_mode));
+        dst += stride;
+    }
+}
+#endif
+
+static bool Bk2CanUseSimdChromaMc(int width, int height,
+                                  int mv_x, int mv_y, int mode)
+{
+#if BK2_HAVE_SSE2
+    if (Bk2McEdgeEnabled() || Bk2McClampMv() || Bk2McParityEnabled()) return false;
+    if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return false;
+
+    const int h = mode & 3;
+    const int v = (mode >> 2) & 3;
+    const int max_x = mv_x + (h != 0 ? 8 : 7);
+    const int max_y = mv_y + (v != 0 ? 8 : 7);
+    return max_x < width && max_y < height;
+#else
+    (void)width;
+    (void)height;
+    (void)mv_x;
+    (void)mv_y;
+    (void)mode;
+    return false;
+#endif
+}
+
 static void ChromaMc8Scalar(uint8_t* dst, int stride,
                             const uint8_t* src, int sstride,
                             int width, int height,
@@ -2657,11 +2911,13 @@ static void ChromaMc8(uint8_t* dst, int stride,
                       int width, int height,
                       int mv_x, int mv_y, int mode)
 {
-    if (Bk2SimdMotionCompActive()) {
-        ChromaMc8Scalar(dst, stride, src, sstride, width, height,
-                        mv_x, mv_y, mode);
+#if BK2_HAVE_SSE2
+    if (Bk2SimdMotionCompActive() &&
+        Bk2CanUseSimdChromaMc(width, height, mv_x, mv_y, mode)) {
+        ChromaMc8Simd(dst, stride, src, sstride, mv_x, mv_y, mode);
         return;
     }
+#endif
     ChromaMc8Scalar(dst, stride, src, sstride, width, height,
                     mv_x, mv_y, mode);
 }
@@ -2697,6 +2953,193 @@ static inline int32_t LumaV(const uint8_t* s, int stride) {
 
 // M9.1 diag: defined near Bk2DumpLumaInit; forward-declared for LumaMc16.
 static int g_bk2_luma_mc_skip_mode[4];
+
+#if BK2_HAVE_SSE2
+static void LumaMc16Simd(uint8_t* dst, int stride,
+                         const uint8_t* src, int sstride,
+                         int mv_x, int mv_y, int mode)
+{
+    const uint8_t* msrc = src + mv_x + mv_y * sstride;
+
+    if (mode == 0) {
+        for (int j = 0; j < 16; ++j) {
+            _mm_storeu_si128((__m128i*)dst,
+                             _mm_loadu_si128((const __m128i*)msrc));
+            dst += stride;
+            msrc += sstride;
+        }
+        return;
+    }
+
+    if (mode == 1) {
+        for (int j = 0; j < 16; ++j) {
+            __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
+            __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+            Bk2Load16To16(msrc - 2, m2_lo, m2_hi);
+            Bk2Load16To16(msrc - 1, m1_lo, m1_hi);
+            Bk2Load16To16(msrc + 0, p0_lo, p0_hi);
+            Bk2Load16To16(msrc + 1, p1_lo, p1_hi);
+            Bk2Load16To16(msrc + 2, p2_lo, p2_hi);
+            Bk2Load16To16(msrc + 3, p3_lo, p3_hi);
+            Bk2Store16From16(dst, Bk2LumaRounded16(m2_lo, m1_lo, p0_lo, p1_lo, p2_lo, p3_lo),
+                                  Bk2LumaRounded16(m2_hi, m1_hi, p0_hi, p1_hi, p2_hi, p3_hi));
+            dst += stride;
+            msrc += sstride;
+        }
+        return;
+    }
+
+    if (mode == 2) {
+        for (int j = 0; j < 16; ++j) {
+            __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
+            __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+            Bk2Load16To16(msrc - 2 * sstride, m2_lo, m2_hi);
+            Bk2Load16To16(msrc - 1 * sstride, m1_lo, m1_hi);
+            Bk2Load16To16(msrc + 0 * sstride, p0_lo, p0_hi);
+            Bk2Load16To16(msrc + 1 * sstride, p1_lo, p1_hi);
+            Bk2Load16To16(msrc + 2 * sstride, p2_lo, p2_hi);
+            Bk2Load16To16(msrc + 3 * sstride, p3_lo, p3_hi);
+            Bk2Store16From16(dst, Bk2LumaRounded16(m2_lo, m1_lo, p0_lo, p1_lo, p2_lo, p3_lo),
+                                  Bk2LumaRounded16(m2_hi, m1_hi, p0_hi, p1_hi, p2_hi, p3_hi));
+            dst += stride;
+            msrc += sstride;
+        }
+        return;
+    }
+
+    if (Bk2McLuma2dI16Temp()) {
+        int16_t temp[21 * 16];
+        const uint8_t* hsrc = msrc - 2 * sstride;
+        for (int i = 0; i < 21; ++i) {
+            __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
+            __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+            Bk2Load16To16(hsrc - 2, m2_lo, m2_hi);
+            Bk2Load16To16(hsrc - 1, m1_lo, m1_hi);
+            Bk2Load16To16(hsrc + 0, p0_lo, p0_hi);
+            Bk2Load16To16(hsrc + 1, p1_lo, p1_hi);
+            Bk2Load16To16(hsrc + 2, p2_lo, p2_hi);
+            Bk2Load16To16(hsrc + 3, p3_lo, p3_hi);
+            _mm_storeu_si128((__m128i*)(temp + i * 16),
+                             Bk2LumaRaw16(m2_lo, m1_lo, p0_lo, p1_lo, p2_lo, p3_lo));
+            _mm_storeu_si128((__m128i*)(temp + i * 16 + 8),
+                             Bk2LumaRaw16(m2_hi, m1_hi, p0_hi, p1_hi, p2_hi, p3_hi));
+            hsrc += sstride;
+        }
+
+        for (int j = 0; j < 16; ++j) {
+            const int16_t* r0 = temp + (j + 0) * 16;
+            const int16_t* r1 = temp + (j + 1) * 16;
+            const int16_t* r2 = temp + (j + 2) * 16;
+            const int16_t* r3 = temp + (j + 3) * 16;
+            const int16_t* r4 = temp + (j + 4) * 16;
+            const int16_t* r5 = temp + (j + 5) * 16;
+            const __m128i r0_lo = _mm_loadu_si128((const __m128i*)(r0 + 0));
+            const __m128i r0_hi = _mm_loadu_si128((const __m128i*)(r0 + 8));
+            const __m128i r1_lo = _mm_loadu_si128((const __m128i*)(r1 + 0));
+            const __m128i r1_hi = _mm_loadu_si128((const __m128i*)(r1 + 8));
+            const __m128i r2_lo = _mm_loadu_si128((const __m128i*)(r2 + 0));
+            const __m128i r2_hi = _mm_loadu_si128((const __m128i*)(r2 + 8));
+            const __m128i r3_lo = _mm_loadu_si128((const __m128i*)(r3 + 0));
+            const __m128i r3_hi = _mm_loadu_si128((const __m128i*)(r3 + 8));
+            const __m128i r4_lo = _mm_loadu_si128((const __m128i*)(r4 + 0));
+            const __m128i r4_hi = _mm_loadu_si128((const __m128i*)(r4 + 8));
+            const __m128i r5_lo = _mm_loadu_si128((const __m128i*)(r5 + 0));
+            const __m128i r5_hi = _mm_loadu_si128((const __m128i*)(r5 + 8));
+
+            const __m128i out_lo = _mm_packs_epi32(
+                Bk2LumaI16TempVertical32(Bk2SignExtendLo16(r0_lo),
+                                         Bk2SignExtendLo16(r1_lo),
+                                         Bk2SignExtendLo16(r2_lo),
+                                         Bk2SignExtendLo16(r3_lo),
+                                         Bk2SignExtendLo16(r4_lo),
+                                         Bk2SignExtendLo16(r5_lo)),
+                Bk2LumaI16TempVertical32(Bk2SignExtendHi16(r0_lo),
+                                         Bk2SignExtendHi16(r1_lo),
+                                         Bk2SignExtendHi16(r2_lo),
+                                         Bk2SignExtendHi16(r3_lo),
+                                         Bk2SignExtendHi16(r4_lo),
+                                         Bk2SignExtendHi16(r5_lo)));
+            const __m128i out_hi = _mm_packs_epi32(
+                Bk2LumaI16TempVertical32(Bk2SignExtendLo16(r0_hi),
+                                         Bk2SignExtendLo16(r1_hi),
+                                         Bk2SignExtendLo16(r2_hi),
+                                         Bk2SignExtendLo16(r3_hi),
+                                         Bk2SignExtendLo16(r4_hi),
+                                         Bk2SignExtendLo16(r5_hi)),
+                Bk2LumaI16TempVertical32(Bk2SignExtendHi16(r0_hi),
+                                         Bk2SignExtendHi16(r1_hi),
+                                         Bk2SignExtendHi16(r2_hi),
+                                         Bk2SignExtendHi16(r3_hi),
+                                         Bk2SignExtendHi16(r4_hi),
+                                         Bk2SignExtendHi16(r5_hi)));
+            Bk2Store16From16(dst, out_lo, out_hi);
+            dst += stride;
+        }
+        return;
+    }
+
+    uint8_t temp[21 * 16];
+    const uint8_t* hsrc = msrc - 2 * sstride;
+    for (int i = 0; i < 21; ++i) {
+        __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
+        __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+        Bk2Load16To16(hsrc - 2, m2_lo, m2_hi);
+        Bk2Load16To16(hsrc - 1, m1_lo, m1_hi);
+        Bk2Load16To16(hsrc + 0, p0_lo, p0_hi);
+        Bk2Load16To16(hsrc + 1, p1_lo, p1_hi);
+        Bk2Load16To16(hsrc + 2, p2_lo, p2_hi);
+        Bk2Load16To16(hsrc + 3, p3_lo, p3_hi);
+        Bk2Store16From16(temp + i * 16,
+                         Bk2LumaRounded16(m2_lo, m1_lo, p0_lo, p1_lo, p2_lo, p3_lo),
+                         Bk2LumaRounded16(m2_hi, m1_hi, p0_hi, p1_hi, p2_hi, p3_hi));
+        hsrc += sstride;
+    }
+
+    for (int j = 0; j < 16; ++j) {
+        __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
+        __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+        Bk2Load16To16(temp + (j + 0) * 16, m2_lo, m2_hi);
+        Bk2Load16To16(temp + (j + 1) * 16, m1_lo, m1_hi);
+        Bk2Load16To16(temp + (j + 2) * 16, p0_lo, p0_hi);
+        Bk2Load16To16(temp + (j + 3) * 16, p1_lo, p1_hi);
+        Bk2Load16To16(temp + (j + 4) * 16, p2_lo, p2_hi);
+        Bk2Load16To16(temp + (j + 5) * 16, p3_lo, p3_hi);
+        Bk2Store16From16(dst, Bk2LumaRounded16(m2_lo, m1_lo, p0_lo, p1_lo, p2_lo, p3_lo),
+                              Bk2LumaRounded16(m2_hi, m1_hi, p0_hi, p1_hi, p2_hi, p3_hi));
+        dst += stride;
+    }
+}
+#endif
+
+static bool Bk2CanUseSimdLumaMc(int width, int height,
+                                int mv_x, int mv_y, int mode)
+{
+#if BK2_HAVE_SSE2
+    if (mode >= 1 && mode <= 3 && g_bk2_luma_mc_skip_mode[mode]) return false;
+    if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return false;
+
+    switch (mode) {
+    case 0:
+        return mv_x + 15 < width && mv_y + 15 < height;
+    case 1:
+        return mv_x >= 2 && mv_x + 18 < width && mv_y + 15 < height;
+    case 2:
+        return mv_x + 15 < width && mv_y >= 2 && mv_y + 18 < height;
+    case 3:
+        return mv_x >= 2 && mv_y >= 2 &&
+               mv_x + 18 < width && mv_y + 18 < height;
+    default:
+        return false;
+    }
+#else
+    (void)width;
+    (void)height;
+    (void)mv_x;
+    (void)mv_y;
+    (void)mode;
+    return false;
+#endif
+}
 
 static void LumaMc16Scalar(uint8_t* dst, int stride,
                            const uint8_t* src, int sstride,
@@ -2772,11 +3215,13 @@ static void LumaMc16(uint8_t* dst, int stride,
                      int width, int height,
                      int mv_x, int mv_y, int mode)
 {
-    if (Bk2SimdMotionCompActive()) {
-        LumaMc16Scalar(dst, stride, src, sstride, width, height,
-                       mv_x, mv_y, mode);
+#if BK2_HAVE_SSE2
+    if (Bk2SimdMotionCompActive() &&
+        Bk2CanUseSimdLumaMc(width, height, mv_x, mv_y, mode)) {
+        LumaMc16Simd(dst, stride, src, sstride, mv_x, mv_y, mode);
         return;
     }
+#endif
     LumaMc16Scalar(dst, stride, src, sstride, width, height,
                    mv_x, mv_y, mode);
 }

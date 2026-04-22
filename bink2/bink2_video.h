@@ -244,9 +244,9 @@ struct Bink2SimdRuntimeConfig {
     bool idct_active = false;
 };
 
-// Reports decoder-side SIMD gate state. Phase 1 keeps the scalar backend as
-// the active implementation while exposing the request/active split so tools
-// and tests can verify fallback behavior.
+// Reports decoder-side SIMD gate state. Motion compensation can become active
+// when requested on a build with the phase-2 SIMD backend available; IDCT
+// remains scalar until the later phase lands.
 Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig();
 
 // Test helper for BK2_SIMD_MC / BK2_SIMD_IDCT env-gate coverage.
