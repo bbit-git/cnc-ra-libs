@@ -236,6 +236,52 @@ int32_t MidPred(int32_t a, int32_t b, int32_t c)
     return a + b + c - std::max(a, std::max(b, c)) - std::min(a, std::min(b, c));
 }
 
+struct Bink2SimdRuntimeCache {
+    std::atomic<int> motion_comp_requested{-1};
+    std::atomic<int> idct_requested{-1};
+};
+
+static Bink2SimdRuntimeCache g_bk2_simd_runtime;
+
+static bool Bk2EnvEnabled(const char* name)
+{
+    const char* e = std::getenv(name);
+    return e && e[0] && e[0] != '0';
+}
+
+static bool Bk2CachedEnvEnabled(std::atomic<int>& cache, const char* name)
+{
+    int v = cache.load(std::memory_order_acquire);
+    if (v != -1) return v != 0;
+    v = Bk2EnvEnabled(name) ? 1 : 0;
+    cache.store(v, std::memory_order_release);
+    return v != 0;
+}
+
+static bool Bk2SimdMotionCompRequested()
+{
+    return Bk2CachedEnvEnabled(g_bk2_simd_runtime.motion_comp_requested,
+                               "BK2_SIMD_MC");
+}
+
+static bool Bk2SimdIdctRequested()
+{
+    return Bk2CachedEnvEnabled(g_bk2_simd_runtime.idct_requested,
+                               "BK2_SIMD_IDCT");
+}
+
+static bool Bk2SimdMotionCompActive()
+{
+    // Phase 1 wires the gate/dispatch surface but keeps scalar active until
+    // SIMD kernels land.
+    return false;
+}
+
+static bool Bk2SimdIdctActive()
+{
+    return false;
+}
+
 int32_t DCMpred(int32_t a, int32_t b, int32_t c)
 {
     const int32_t lo = std::min(a, std::min(b, c));
@@ -290,7 +336,7 @@ void Bink2gIdct1d(int16_t *blk, int step, int shift)
 #undef idct_mul_e
 }
 
-void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
+static void Bink2gIdctPutScalar(uint8_t *dst, int stride, int16_t *block)
 {
     for (int i = 0; i < 8; ++i)
         Bink2gIdct1d(block + i, 8, 0);
@@ -301,6 +347,15 @@ void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
             dst[j] = (uint8_t)ClipInt(block[j * 8 + i], 0, 255);
         dst += stride;
     }
+}
+
+void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
+{
+    if (Bk2SimdIdctActive()) {
+        Bink2gIdctPutScalar(dst, stride, block);
+        return;
+    }
+    Bink2gIdctPutScalar(dst, stride, block);
 }
 
 void PutDcOnlyBlock(uint8_t *dst, int stride, int32_t dc)
@@ -1805,6 +1860,22 @@ bool DecodeTargetMacroblockBudget(Bink2BitReader& bits,
 
 } // namespace
 
+Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig()
+{
+    Bink2SimdRuntimeConfig cfg;
+    cfg.motion_comp_requested = Bk2SimdMotionCompRequested();
+    cfg.motion_comp_active = Bk2SimdMotionCompActive();
+    cfg.idct_requested = Bk2SimdIdctRequested();
+    cfg.idct_active = Bk2SimdIdctActive();
+    return cfg;
+}
+
+void Bink2ResetSimdRuntimeConfigForTests()
+{
+    g_bk2_simd_runtime.motion_comp_requested.store(-1, std::memory_order_release);
+    g_bk2_simd_runtime.idct_requested.store(-1, std::memory_order_release);
+}
+
 bool Bink2PrepareFramePlan(const Bink2Header& header,
                            const Bink2PacketHeader& packet_header,
                            const std::vector<uint8_t>& packet,
@@ -2414,10 +2485,10 @@ static inline bool Bk2McClampMv() {
     return on;
 }
 
-static void ChromaMc8(uint8_t* dst, int stride,
-                      const uint8_t* src, int sstride,
-                      int width, int height,
-                      int mv_x, int mv_y, int mode)
+static void ChromaMc8Scalar(uint8_t* dst, int stride,
+                            const uint8_t* src, int sstride,
+                            int width, int height,
+                            int mv_x, int mv_y, int mode)
 {
     const int h_mode = mode & 3;
     const int v_mode = (mode >> 2) & 3;
@@ -2581,6 +2652,20 @@ static void ChromaMc8(uint8_t* dst, int stride,
     }
 }
 
+static void ChromaMc8(uint8_t* dst, int stride,
+                      const uint8_t* src, int sstride,
+                      int width, int height,
+                      int mv_x, int mv_y, int mode)
+{
+    if (Bk2SimdMotionCompActive()) {
+        ChromaMc8Scalar(dst, stride, src, sstride, width, height,
+                        mv_x, mv_y, mode);
+        return;
+    }
+    ChromaMc8Scalar(dst, stride, src, sstride, width, height,
+                    mv_x, mv_y, mode);
+}
+
 static void ChromaMcMacroblock(const Bink2MvBlock& mv,
                                int x, int y,
                                uint8_t* dst, int stride,
@@ -2613,10 +2698,10 @@ static inline int32_t LumaV(const uint8_t* s, int stride) {
 // M9.1 diag: defined near Bk2DumpLumaInit; forward-declared for LumaMc16.
 static int g_bk2_luma_mc_skip_mode[4];
 
-static void LumaMc16(uint8_t* dst, int stride,
-                     const uint8_t* src, int sstride,
-                     int width, int height,
-                     int mv_x, int mv_y, int mode)
+static void LumaMc16Scalar(uint8_t* dst, int stride,
+                           const uint8_t* src, int sstride,
+                           int width, int height,
+                           int mv_x, int mv_y, int mode)
 {
     if (mv_x < 0 || mv_x >= width || mv_y < 0 || mv_y >= height) return;
     // M9.1 diag: optionally substitute integer MC for a specific sub-pel mode
@@ -2680,6 +2765,20 @@ static void LumaMc16(uint8_t* dst, int stride,
             dst += stride;
         }
     }
+}
+
+static void LumaMc16(uint8_t* dst, int stride,
+                     const uint8_t* src, int sstride,
+                     int width, int height,
+                     int mv_x, int mv_y, int mode)
+{
+    if (Bk2SimdMotionCompActive()) {
+        LumaMc16Scalar(dst, stride, src, sstride, width, height,
+                       mv_x, mv_y, mode);
+        return;
+    }
+    LumaMc16Scalar(dst, stride, src, sstride, width, height,
+                   mv_x, mv_y, mode);
 }
 
 static void LumaMcMacroblock(const Bink2MvBlock& mv,
@@ -2790,7 +2889,7 @@ static inline int Bk2QBucket(int32_t q) {
 }
 
 // idct_add: run IDCT on `block` and add (saturating) into dst[8x8].
-static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
+static void Bink2gIdctAddScalar(uint8_t* dst, int stride, int16_t* block)
 {
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i,     8, 0);
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i * 8, 1, 6);
@@ -2801,10 +2900,19 @@ static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
     }
 }
 
+static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
+{
+    if (Bk2SimdIdctActive()) {
+        Bink2gIdctAddScalar(dst, stride, block);
+        return;
+    }
+    Bink2gIdctAddScalar(dst, stride, block);
+}
+
 // Chroma variant: same arithmetic, plus saturation-event counters.
 // dc_hint / max_ac_hint / q_hint are for diagnostic bucketing only.
-static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
-                                int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
+static void Bink2gChromaIdctAddScalar(uint8_t* dst, int stride, int16_t* block,
+                                      int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
 {
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i,     8, 0);
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i * 8, 1, 6);
@@ -2828,6 +2936,18 @@ static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
     g_chroma_sat.by_dc[dc_b].pixels += 64; g_chroma_sat.by_dc[dc_b].sum += block_sum;
     g_chroma_sat.by_ac[ac_b].pixels += 64; g_chroma_sat.by_ac[ac_b].sum += block_sum;
     g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
+}
+
+static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
+                                int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
+{
+    if (Bk2SimdIdctActive()) {
+        Bink2gChromaIdctAddScalar(dst, stride, block,
+                                  dc_hint, max_ac_hint, q_hint);
+        return;
+    }
+    Bink2gChromaIdctAddScalar(dst, stride, block,
+                              dc_hint, max_ac_hint, q_hint);
 }
 
 // ---- BK2_DUMP_INTER_LUMA_MB / BK2_DUMP_LUMA_MC diagnostic ----

@@ -237,6 +237,21 @@ struct Bink2KeyframeMacroblockTrace {
     std::vector<Bink2KeyframeMacroblockTraceEntry> entries;
 };
 
+struct Bink2SimdRuntimeConfig {
+    bool motion_comp_requested = false;
+    bool motion_comp_active = false;
+    bool idct_requested = false;
+    bool idct_active = false;
+};
+
+// Reports decoder-side SIMD gate state. Phase 1 keeps the scalar backend as
+// the active implementation while exposing the request/active split so tools
+// and tests can verify fallback behavior.
+Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig();
+
+// Test helper for BK2_SIMD_MC / BK2_SIMD_IDCT env-gate coverage.
+void Bink2ResetSimdRuntimeConfigForTests();
+
 bool Bink2PrepareFramePlan(const Bink2Header& header,
                            const Bink2PacketHeader& packet_header,
                            const std::vector<uint8_t>& packet,
