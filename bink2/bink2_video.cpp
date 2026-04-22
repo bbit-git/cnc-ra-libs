@@ -250,6 +250,7 @@ struct Bink2SimdRuntimeCache {
 };
 
 static Bink2SimdRuntimeCache g_bk2_simd_runtime;
+static std::atomic<uint32_t> g_bk2_luma_mc_skip_mode_scalar_fallbacks[4];
 
 static bool Bk2EnvEnabled(const char* name)
 {
@@ -291,6 +292,14 @@ static bool Bk2SimdMotionCompActive()
 static bool Bk2SimdIdctActive()
 {
     return false;
+}
+
+static void Bk2RecordLumaMcScalarFallback(int mode)
+{
+    if (mode >= 1 && mode <= 3) {
+        g_bk2_luma_mc_skip_mode_scalar_fallbacks[mode].fetch_add(
+            1u, std::memory_order_relaxed);
+    }
 }
 
 int32_t DCMpred(int32_t a, int32_t b, int32_t c)
@@ -1871,6 +1880,8 @@ bool DecodeTargetMacroblockBudget(Bink2BitReader& bits,
 
 } // namespace
 
+static void Bk2DumpLumaInit();
+
 Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig()
 {
     Bink2SimdRuntimeConfig cfg;
@@ -1885,6 +1896,17 @@ void Bink2ResetSimdRuntimeConfigForTests()
 {
     g_bk2_simd_runtime.motion_comp_requested.store(-1, std::memory_order_release);
     g_bk2_simd_runtime.idct_requested.store(-1, std::memory_order_release);
+}
+
+Bink2SimdMotionCompCounters Bink2GetSimdMotionCompCounters()
+{
+    Bink2SimdMotionCompCounters counters;
+    for (int mode = 1; mode <= 3; ++mode) {
+        counters.luma_skip_mode_scalar_fallbacks[mode] =
+            g_bk2_luma_mc_skip_mode_scalar_fallbacks[mode].load(
+                std::memory_order_relaxed);
+    }
+    return counters;
 }
 
 bool Bink2PrepareFramePlan(const Bink2Header& header,
@@ -3216,14 +3238,26 @@ static void LumaMc16(uint8_t* dst, int stride,
                      int mv_x, int mv_y, int mode)
 {
 #if BK2_HAVE_SSE2
-    if (Bk2SimdMotionCompActive() &&
-        Bk2CanUseSimdLumaMc(width, height, mv_x, mv_y, mode)) {
-        LumaMc16Simd(dst, stride, src, sstride, mv_x, mv_y, mode);
-        return;
+    if (Bk2SimdMotionCompActive()) {
+        if (mode >= 1 && mode <= 3 && g_bk2_luma_mc_skip_mode[mode]) {
+            Bk2RecordLumaMcScalarFallback(mode);
+        } else if (Bk2CanUseSimdLumaMc(width, height, mv_x, mv_y, mode)) {
+            LumaMc16Simd(dst, stride, src, sstride, mv_x, mv_y, mode);
+            return;
+        }
     }
 #endif
     LumaMc16Scalar(dst, stride, src, sstride, width, height,
                    mv_x, mv_y, mode);
+}
+
+void Bink2TestRunLumaMc16(uint8_t* dst, int stride,
+                          const uint8_t* src, int sstride,
+                          int width, int height,
+                          int mv_x, int mv_y, int mode)
+{
+    Bk2DumpLumaInit();
+    LumaMc16(dst, stride, src, sstride, width, height, mv_x, mv_y, mode);
 }
 
 static void LumaMcMacroblock(const Bink2MvBlock& mv,
@@ -3451,6 +3485,19 @@ static void Bk2DumpLumaInit()
     const char* c = std::getenv("BK2_DUMP_INTER_LUMA_MB_COLS");
     if (!c) c = std::getenv("BK2_DUMP_LUMA_MC_COLS");
     if (c) std::sscanf(c, "%d:%d", &g_bk2_dump_luma_c0, &g_bk2_dump_luma_c1);
+}
+
+void Bink2ResetSimdMotionCompCountersForTests()
+{
+    for (int mode = 1; mode <= 3; ++mode) {
+        g_bk2_luma_mc_skip_mode_scalar_fallbacks[mode].store(
+            0u, std::memory_order_relaxed);
+        g_bk2_luma_mc_skip_mode[mode] = 0;
+    }
+    g_bk2_dump_luma_residue_enable = -1;
+    g_bk2_dump_luma_mc_enable = -1;
+    g_bk2_dump_luma_mc_src_enable = 0;
+    g_bk2_dump_ac_coefs_enable = -1;
 }
 
 static bool Bk2DumpLumaMatch()

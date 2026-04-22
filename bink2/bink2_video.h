@@ -244,6 +244,10 @@ struct Bink2SimdRuntimeConfig {
     bool idct_active = false;
 };
 
+struct Bink2SimdMotionCompCounters {
+    uint32_t luma_skip_mode_scalar_fallbacks[4] = {};
+};
+
 // Reports decoder-side SIMD gate state. Motion compensation can become active
 // when requested on a build with the phase-2 SIMD backend available; IDCT
 // remains scalar until the later phase lands.
@@ -251,6 +255,13 @@ Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig();
 
 // Test helper for BK2_SIMD_MC / BK2_SIMD_IDCT env-gate coverage.
 void Bink2ResetSimdRuntimeConfigForTests();
+// Test helper for asserting SIMD/scalar motion-comp dispatch boundaries.
+Bink2SimdMotionCompCounters Bink2GetSimdMotionCompCounters();
+void Bink2ResetSimdMotionCompCountersForTests();
+void Bink2TestRunLumaMc16(uint8_t* dst, int stride,
+                          const uint8_t* src, int sstride,
+                          int width, int height,
+                          int mv_x, int mv_y, int mode);
 
 bool Bink2PrepareFramePlan(const Bink2Header& header,
                            const Bink2PacketHeader& packet_header,
