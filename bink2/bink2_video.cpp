@@ -291,7 +291,12 @@ static bool Bk2SimdMotionCompActive()
 
 static bool Bk2SimdIdctActive()
 {
-    return false;
+    return Bk2SimdIdctRequested() &&
+#if BK2_HAVE_SSE2
+           true;
+#else
+           false;
+#endif
 }
 
 static void Bk2RecordLumaMcScalarFallback(int mode)
@@ -356,6 +361,239 @@ void Bink2gIdct1d(int16_t *blk, int step, int shift)
 #undef idct_mul_e
 }
 
+#if BK2_HAVE_SSE2
+static inline __m128i Bk2IdctMulA32(__m128i val)
+{
+    return _mm_add_epi32(val, _mm_srai_epi32(val, 2));
+}
+
+static inline __m128i Bk2IdctMulB32(__m128i val)
+{
+    return _mm_srai_epi32(val, 1);
+}
+
+static inline __m128i Bk2IdctMulC32(__m128i val)
+{
+    return _mm_sub_epi32(_mm_sub_epi32(val, _mm_srai_epi32(val, 2)),
+                         _mm_srai_epi32(val, 4));
+}
+
+static inline __m128i Bk2IdctMulD32(__m128i val)
+{
+    return _mm_sub_epi32(_mm_add_epi32(val, _mm_srai_epi32(val, 2)),
+                         _mm_srai_epi32(val, 4));
+}
+
+static inline __m128i Bk2IdctMulE32(__m128i val)
+{
+    return _mm_srai_epi32(val, 2);
+}
+
+static inline void Bk2Idct1dSimd4(__m128i blk0, __m128i blk1,
+                                  __m128i blk2, __m128i blk3,
+                                  __m128i blk4, __m128i blk5,
+                                  __m128i blk6, __m128i blk7,
+                                  int shift,
+                                  __m128i& out0, __m128i& out1,
+                                  __m128i& out2, __m128i& out3,
+                                  __m128i& out4, __m128i& out5,
+                                  __m128i& out6, __m128i& out7)
+{
+    const __m128i tmp00 = _mm_add_epi32(blk3, blk5);
+    const __m128i tmp01 = _mm_sub_epi32(blk3, blk5);
+    const __m128i tmp02 = _mm_add_epi32(Bk2IdctMulA32(blk2), Bk2IdctMulB32(blk6));
+    const __m128i tmp03 = _mm_sub_epi32(Bk2IdctMulB32(blk2), Bk2IdctMulA32(blk6));
+    const __m128i sum04 = _mm_add_epi32(blk0, blk4);
+    const __m128i tmp0 = _mm_add_epi32(sum04, tmp02);
+    const __m128i tmp1 = _mm_sub_epi32(sum04, tmp02);
+    const __m128i tmp2 = _mm_sub_epi32(blk0, blk4);
+    const __m128i tmp3 = _mm_add_epi32(blk1, tmp00);
+    const __m128i tmp4 = _mm_sub_epi32(blk1, tmp00);
+    const __m128i tmp5 = _mm_add_epi32(tmp01, blk7);
+    const __m128i tmp6 = _mm_sub_epi32(tmp01, blk7);
+    const __m128i tmp7 = _mm_add_epi32(tmp4, Bk2IdctMulC32(tmp6));
+    const __m128i tmp8 = _mm_sub_epi32(Bk2IdctMulC32(tmp4), tmp6);
+    const __m128i tmp9 = _mm_add_epi32(Bk2IdctMulD32(tmp3), Bk2IdctMulE32(tmp5));
+    const __m128i tmp10 = _mm_sub_epi32(Bk2IdctMulE32(tmp3), Bk2IdctMulD32(tmp5));
+    const __m128i tmp11 = _mm_add_epi32(tmp2, tmp03);
+    const __m128i tmp12 = _mm_sub_epi32(tmp2, tmp03);
+
+    if (shift > 0) {
+        out0 = _mm_srai_epi32(_mm_add_epi32(tmp0,  tmp9),  shift);
+        out1 = _mm_srai_epi32(_mm_add_epi32(tmp11, tmp7),  shift);
+        out2 = _mm_srai_epi32(_mm_add_epi32(tmp12, tmp8),  shift);
+        out3 = _mm_srai_epi32(_mm_add_epi32(tmp1,  tmp10), shift);
+        out4 = _mm_srai_epi32(_mm_sub_epi32(tmp1,  tmp10), shift);
+        out5 = _mm_srai_epi32(_mm_sub_epi32(tmp12, tmp8),  shift);
+        out6 = _mm_srai_epi32(_mm_sub_epi32(tmp11, tmp7),  shift);
+        out7 = _mm_srai_epi32(_mm_sub_epi32(tmp0,  tmp9),  shift);
+    } else {
+        out0 = _mm_add_epi32(tmp0,  tmp9);
+        out1 = _mm_add_epi32(tmp11, tmp7);
+        out2 = _mm_add_epi32(tmp12, tmp8);
+        out3 = _mm_add_epi32(tmp1,  tmp10);
+        out4 = _mm_sub_epi32(tmp1,  tmp10);
+        out5 = _mm_sub_epi32(tmp12, tmp8);
+        out6 = _mm_sub_epi32(tmp11, tmp7);
+        out7 = _mm_sub_epi32(tmp0,  tmp9);
+    }
+}
+
+// Truncating (wrap-preserving) int32x4 + int32x4 -> int16x8 pack. Matches
+// scalar `(int16_t)x` modulo-2^16 wrap; avoids _mm_packs_epi32's clamp so
+// column-pass intermediates with |value| > 32767 stay byte-identical to scalar.
+static inline __m128i Bk2IdctPackWrap32To16(__m128i lo, __m128i hi)
+{
+    const __m128i a = _mm_srai_epi32(_mm_slli_epi32(lo, 16), 16);
+    const __m128i b = _mm_srai_epi32(_mm_slli_epi32(hi, 16), 16);
+    return _mm_packs_epi32(a, b);
+}
+
+static inline __m128i Bk2IdctSignExtendLo16(__m128i values)
+{
+    const __m128i sign = _mm_cmpgt_epi16(_mm_setzero_si128(), values);
+    return _mm_unpacklo_epi16(values, sign);
+}
+
+static inline __m128i Bk2IdctSignExtendHi16(__m128i values)
+{
+    const __m128i sign = _mm_cmpgt_epi16(_mm_setzero_si128(), values);
+    return _mm_unpackhi_epi16(values, sign);
+}
+
+static inline void Bk2Idct1dSimd8(__m128i blk0, __m128i blk1,
+                                  __m128i blk2, __m128i blk3,
+                                  __m128i blk4, __m128i blk5,
+                                  __m128i blk6, __m128i blk7,
+                                  int shift,
+                                  __m128i& out0, __m128i& out1,
+                                  __m128i& out2, __m128i& out3,
+                                  __m128i& out4, __m128i& out5,
+                                  __m128i& out6, __m128i& out7)
+{
+    __m128i lo0, lo1, lo2, lo3, lo4, lo5, lo6, lo7;
+    __m128i hi0, hi1, hi2, hi3, hi4, hi5, hi6, hi7;
+
+    Bk2Idct1dSimd4(Bk2IdctSignExtendLo16(blk0), Bk2IdctSignExtendLo16(blk1),
+                   Bk2IdctSignExtendLo16(blk2), Bk2IdctSignExtendLo16(blk3),
+                   Bk2IdctSignExtendLo16(blk4), Bk2IdctSignExtendLo16(blk5),
+                   Bk2IdctSignExtendLo16(blk6), Bk2IdctSignExtendLo16(blk7),
+                   shift,
+                   lo0, lo1, lo2, lo3, lo4, lo5, lo6, lo7);
+    Bk2Idct1dSimd4(Bk2IdctSignExtendHi16(blk0), Bk2IdctSignExtendHi16(blk1),
+                   Bk2IdctSignExtendHi16(blk2), Bk2IdctSignExtendHi16(blk3),
+                   Bk2IdctSignExtendHi16(blk4), Bk2IdctSignExtendHi16(blk5),
+                   Bk2IdctSignExtendHi16(blk6), Bk2IdctSignExtendHi16(blk7),
+                   shift,
+                   hi0, hi1, hi2, hi3, hi4, hi5, hi6, hi7);
+
+    out0 = Bk2IdctPackWrap32To16(lo0, hi0);
+    out1 = Bk2IdctPackWrap32To16(lo1, hi1);
+    out2 = Bk2IdctPackWrap32To16(lo2, hi2);
+    out3 = Bk2IdctPackWrap32To16(lo3, hi3);
+    out4 = Bk2IdctPackWrap32To16(lo4, hi4);
+    out5 = Bk2IdctPackWrap32To16(lo5, hi5);
+    out6 = Bk2IdctPackWrap32To16(lo6, hi6);
+    out7 = Bk2IdctPackWrap32To16(lo7, hi7);
+}
+
+static inline void Bk2Transpose8x8I16(__m128i in0, __m128i in1,
+                                      __m128i in2, __m128i in3,
+                                      __m128i in4, __m128i in5,
+                                      __m128i in6, __m128i in7,
+                                      __m128i& out0, __m128i& out1,
+                                      __m128i& out2, __m128i& out3,
+                                      __m128i& out4, __m128i& out5,
+                                      __m128i& out6, __m128i& out7)
+{
+    const __m128i t0 = _mm_unpacklo_epi16(in0, in1);
+    const __m128i t1 = _mm_unpackhi_epi16(in0, in1);
+    const __m128i t2 = _mm_unpacklo_epi16(in2, in3);
+    const __m128i t3 = _mm_unpackhi_epi16(in2, in3);
+    const __m128i t4 = _mm_unpacklo_epi16(in4, in5);
+    const __m128i t5 = _mm_unpackhi_epi16(in4, in5);
+    const __m128i t6 = _mm_unpacklo_epi16(in6, in7);
+    const __m128i t7 = _mm_unpackhi_epi16(in6, in7);
+
+    const __m128i u0 = _mm_unpacklo_epi32(t0, t2);
+    const __m128i u1 = _mm_unpackhi_epi32(t0, t2);
+    const __m128i u2 = _mm_unpacklo_epi32(t1, t3);
+    const __m128i u3 = _mm_unpackhi_epi32(t1, t3);
+    const __m128i u4 = _mm_unpacklo_epi32(t4, t6);
+    const __m128i u5 = _mm_unpackhi_epi32(t4, t6);
+    const __m128i u6 = _mm_unpacklo_epi32(t5, t7);
+    const __m128i u7 = _mm_unpackhi_epi32(t5, t7);
+
+    out0 = _mm_unpacklo_epi64(u0, u4);
+    out1 = _mm_unpackhi_epi64(u0, u4);
+    out2 = _mm_unpacklo_epi64(u1, u5);
+    out3 = _mm_unpackhi_epi64(u1, u5);
+    out4 = _mm_unpacklo_epi64(u2, u6);
+    out5 = _mm_unpackhi_epi64(u2, u6);
+    out6 = _mm_unpacklo_epi64(u3, u7);
+    out7 = _mm_unpackhi_epi64(u3, u7);
+}
+
+static inline void Bk2StorePackedRow8(uint8_t* dst, __m128i values)
+{
+    const __m128i packed = _mm_packus_epi16(values, _mm_setzero_si128());
+    _mm_storel_epi64((__m128i*)dst, packed);
+}
+
+static inline __m128i Bk2LoadU8Row8(const uint8_t* src)
+{
+    return _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)src),
+                             _mm_setzero_si128());
+}
+
+static inline void Bk2IdctAddResidualRowsSimd(uint8_t* dst, int stride,
+                                              const __m128i rows[8])
+{
+    for (int i = 0; i < 8; ++i) {
+        const __m128i sum = _mm_adds_epi16(Bk2LoadU8Row8(dst), rows[i]);
+        Bk2StorePackedRow8(dst, sum);
+        dst += stride;
+    }
+}
+
+static inline void Bk2IdctTransformSimd(int16_t* block, __m128i rows[8])
+{
+    __m128i cols[8];
+    __m128i row_stage[8];
+    __m128i final_cols[8];
+
+    for (int i = 0; i < 8; ++i) {
+        cols[i] = _mm_loadu_si128((const __m128i*)(block + i * 8));
+    }
+
+    Bk2Idct1dSimd8(cols[0], cols[1], cols[2], cols[3],
+                   cols[4], cols[5], cols[6], cols[7],
+                   0,
+                   cols[0], cols[1], cols[2], cols[3],
+                   cols[4], cols[5], cols[6], cols[7]);
+
+    Bk2Transpose8x8I16(cols[0], cols[1], cols[2], cols[3],
+                       cols[4], cols[5], cols[6], cols[7],
+                       row_stage[0], row_stage[1], row_stage[2], row_stage[3],
+                       row_stage[4], row_stage[5], row_stage[6], row_stage[7]);
+
+    Bk2Idct1dSimd8(row_stage[0], row_stage[1], row_stage[2], row_stage[3],
+                   row_stage[4], row_stage[5], row_stage[6], row_stage[7],
+                   6,
+                   rows[0], rows[1], rows[2], rows[3],
+                   rows[4], rows[5], rows[6], rows[7]);
+
+    Bk2Transpose8x8I16(rows[0], rows[1], rows[2], rows[3],
+                       rows[4], rows[5], rows[6], rows[7],
+                       final_cols[0], final_cols[1], final_cols[2], final_cols[3],
+                       final_cols[4], final_cols[5], final_cols[6], final_cols[7]);
+
+    for (int i = 0; i < 8; ++i) {
+        _mm_storeu_si128((__m128i*)(block + i * 8), final_cols[i]);
+    }
+}
+#endif
+
 static void Bink2gIdctPutScalar(uint8_t *dst, int stride, int16_t *block)
 {
     for (int i = 0; i < 8; ++i)
@@ -369,10 +607,24 @@ static void Bink2gIdctPutScalar(uint8_t *dst, int stride, int16_t *block)
     }
 }
 
+static void Bink2gIdctPutSimd(uint8_t *dst, int stride, int16_t *block)
+{
+#if BK2_HAVE_SSE2
+    __m128i rows[8];
+    Bk2IdctTransformSimd(block, rows);
+    for (int i = 0; i < 8; ++i) {
+        Bk2StorePackedRow8(dst, rows[i]);
+        dst += stride;
+    }
+#else
+    Bink2gIdctPutScalar(dst, stride, block);
+#endif
+}
+
 void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
 {
     if (Bk2SimdIdctActive()) {
-        Bink2gIdctPutScalar(dst, stride, block);
+        Bink2gIdctPutSimd(dst, stride, block);
         return;
     }
     Bink2gIdctPutScalar(dst, stride, block);
@@ -3287,25 +3539,11 @@ static void LumaMcMacroblock(const Bink2MvBlock& mv,
 // `by_ac` buckets by max |AC| of the block (AC = all block[] except [0]):
 // 0 = max==0, 1 = 1..15, 2 = 16..63, 3 = 64..255, 4 = 256+.
 // `by_q` buckets by the block's inter q: 0..9, 10..19, 20..29, 30..36.
-struct Bink2ChromaSatBucket {
-    uint64_t pixels = 0;
-    int64_t  sum = 0;
-};
-struct Bink2ChromaSatCounters {
-    uint64_t low = 0;   // pixels clamped at 0 (sum < 0)
-    uint64_t high = 0;  // pixels clamped at 255 (sum > 255)
-    uint64_t pixels = 0; // total pixels seen
-    int64_t  sum_residual = 0; // signed sum of all chroma IDCT residuals
-    Bink2ChromaSatBucket by_dc[5];
-    Bink2ChromaSatBucket by_ac[5];
-    Bink2ChromaSatBucket by_q[4];
+struct Bink2ChromaSatCountersWithReporting final : Bink2ChromaSatCounters {
     // Decoded-DC aggregates (pre-IDCT, pre-bias): helps decide whether the
     // residual green bias comes from the IDCT path (mean_dc==0) or from
     // biased DC decode (mean_dc!=0).
-    uint64_t dc_blocks = 0;
-    int64_t  sum_dc = 0;    // signed sum of raw dc[j] values
-    int64_t  sum_abs_dc = 0; // sum of |dc[j]|
-    ~Bink2ChromaSatCounters() {
+    ~Bink2ChromaSatCountersWithReporting() {
         if (const char* e = std::getenv("BK2_REPORT_CHROMA_SAT");
             e && e[0] && e[0] != '0' && pixels) {
             std::fprintf(stderr,
@@ -3343,7 +3581,17 @@ struct Bink2ChromaSatCounters {
         }
     }
 };
-static Bink2ChromaSatCounters g_chroma_sat;
+static Bink2ChromaSatCountersWithReporting g_chroma_sat;
+
+Bink2ChromaSatCounters Bink2GetChromaSatCountersForTests()
+{
+    return g_chroma_sat;
+}
+
+void Bink2ResetChromaSatCountersForTests()
+{
+    g_chroma_sat = Bink2ChromaSatCountersWithReporting{};
+}
 
 static inline int Bk2DcBucket(int32_t dc) {
     const int32_t a = dc < 0 ? -dc : dc;
@@ -3379,10 +3627,31 @@ static void Bink2gIdctAddScalar(uint8_t* dst, int stride, int16_t* block)
     }
 }
 
+static void Bink2gIdctAddResidualRowsScalar(uint8_t* dst, int stride,
+                                            const int16_t* rows)
+{
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j)
+            dst[j] = Clip255((int32_t)dst[j] + rows[i * 8 + j]);
+        dst += stride;
+    }
+}
+
+static void Bink2gIdctAddSimd(uint8_t* dst, int stride, int16_t* block)
+{
+#if BK2_HAVE_SSE2
+    __m128i rows[8];
+    Bk2IdctTransformSimd(block, rows);
+    Bk2IdctAddResidualRowsSimd(dst, stride, rows);
+#else
+    Bink2gIdctAddScalar(dst, stride, block);
+#endif
+}
+
 static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
 {
     if (Bk2SimdIdctActive()) {
-        Bink2gIdctAddScalar(dst, stride, block);
+        Bink2gIdctAddSimd(dst, stride, block);
         return;
     }
     Bink2gIdctAddScalar(dst, stride, block);
@@ -3417,16 +3686,82 @@ static void Bink2gChromaIdctAddScalar(uint8_t* dst, int stride, int16_t* block,
     g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
 }
 
+static void Bink2gChromaIdctAddSimd(uint8_t* dst, int stride, int16_t* block,
+                                    int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
+{
+#if BK2_HAVE_SSE2
+    __m128i rows[8];
+    Bk2IdctTransformSimd(block, rows);
+    const int dc_b = Bk2DcBucket(dc_hint);
+    const int ac_b = Bk2AcBucket(max_ac_hint);
+    const int q_b  = Bk2QBucket(q_hint);
+    int64_t block_sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        alignas(16) int16_t residuals[8];
+        _mm_storeu_si128((__m128i*)residuals, rows[i]);
+        for (int j = 0; j < 8; ++j) {
+            const int32_t r = residuals[j];
+            const int32_t s = (int32_t)dst[j] + r;
+            g_chroma_sat.sum_residual += r;
+            ++g_chroma_sat.pixels;
+            block_sum += r;
+            if (s < 0)        ++g_chroma_sat.low;
+            else if (s > 255) ++g_chroma_sat.high;
+            dst[j] = Clip255(s);
+        }
+        dst += stride;
+    }
+    g_chroma_sat.by_dc[dc_b].pixels += 64; g_chroma_sat.by_dc[dc_b].sum += block_sum;
+    g_chroma_sat.by_ac[ac_b].pixels += 64; g_chroma_sat.by_ac[ac_b].sum += block_sum;
+    g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
+#else
+    Bink2gChromaIdctAddScalar(dst, stride, block, dc_hint, max_ac_hint, q_hint);
+#endif
+}
+
 static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
                                 int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
 {
     if (Bk2SimdIdctActive()) {
-        Bink2gChromaIdctAddScalar(dst, stride, block,
-                                  dc_hint, max_ac_hint, q_hint);
+        Bink2gChromaIdctAddSimd(dst, stride, block,
+                                dc_hint, max_ac_hint, q_hint);
         return;
     }
     Bink2gChromaIdctAddScalar(dst, stride, block,
                               dc_hint, max_ac_hint, q_hint);
+}
+
+void Bink2TestRunIdctPut(uint8_t* dst, int stride, int16_t* block)
+{
+    Bink2gIdctPut(dst, stride, block);
+}
+
+void Bink2TestRunIdctAdd(uint8_t* dst, int stride, int16_t* block)
+{
+    Bink2gIdctAdd(dst, stride, block);
+}
+
+void Bink2TestRunIdctAddResidualRows(uint8_t* dst, int stride,
+                                     const int16_t* rows)
+{
+    if (Bk2SimdIdctActive()) {
+#if BK2_HAVE_SSE2
+        __m128i row_vectors[8];
+        for (int i = 0; i < 8; ++i) {
+            row_vectors[i] = _mm_loadu_si128((const __m128i*)(rows + i * 8));
+        }
+        Bk2IdctAddResidualRowsSimd(dst, stride, row_vectors);
+        return;
+#endif
+    }
+    Bink2gIdctAddResidualRowsScalar(dst, stride, rows);
+}
+
+void Bink2TestRunChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
+                               int32_t dc_hint, int32_t max_ac_hint,
+                               int32_t q_hint)
+{
+    Bink2gChromaIdctAdd(dst, stride, block, dc_hint, max_ac_hint, q_hint);
 }
 
 // ---- BK2_DUMP_INTER_LUMA_MB / BK2_DUMP_LUMA_MC diagnostic ----

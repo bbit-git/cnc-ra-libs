@@ -248,9 +248,27 @@ struct Bink2SimdMotionCompCounters {
     uint32_t luma_skip_mode_scalar_fallbacks[4] = {};
 };
 
-// Reports decoder-side SIMD gate state. Motion compensation can become active
-// when requested on a build with the phase-2 SIMD backend available; IDCT
-// remains scalar until the later phase lands.
+struct Bink2ChromaSatBucket {
+    uint64_t pixels = 0;
+    int64_t  sum = 0;
+};
+
+struct Bink2ChromaSatCounters {
+    uint64_t low = 0;
+    uint64_t high = 0;
+    uint64_t pixels = 0;
+    int64_t  sum_residual = 0;
+    Bink2ChromaSatBucket by_dc[5];
+    Bink2ChromaSatBucket by_ac[5];
+    Bink2ChromaSatBucket by_q[4];
+    uint64_t dc_blocks = 0;
+    int64_t  sum_dc = 0;
+    int64_t  sum_abs_dc = 0;
+};
+
+// Reports decoder-side SIMD gate state. Motion compensation and IDCT can
+// become active when requested on builds with the corresponding SIMD backend
+// available.
 Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig();
 
 // Test helper for BK2_SIMD_MC / BK2_SIMD_IDCT env-gate coverage.
@@ -258,10 +276,19 @@ void Bink2ResetSimdRuntimeConfigForTests();
 // Test helper for asserting SIMD/scalar motion-comp dispatch boundaries.
 Bink2SimdMotionCompCounters Bink2GetSimdMotionCompCounters();
 void Bink2ResetSimdMotionCompCountersForTests();
+Bink2ChromaSatCounters Bink2GetChromaSatCountersForTests();
+void Bink2ResetChromaSatCountersForTests();
 void Bink2TestRunLumaMc16(uint8_t* dst, int stride,
                           const uint8_t* src, int sstride,
                           int width, int height,
                           int mv_x, int mv_y, int mode);
+void Bink2TestRunIdctPut(uint8_t* dst, int stride, int16_t* block);
+void Bink2TestRunIdctAdd(uint8_t* dst, int stride, int16_t* block);
+void Bink2TestRunIdctAddResidualRows(uint8_t* dst, int stride,
+                                     const int16_t* rows);
+void Bink2TestRunChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
+                               int32_t dc_hint, int32_t max_ac_hint,
+                               int32_t q_hint);
 
 bool Bink2PrepareFramePlan(const Bink2Header& header,
                            const Bink2PacketHeader& packet_header,
