@@ -242,6 +242,12 @@ struct Bink2SimdRuntimeConfig {
     bool motion_comp_active = false;
     bool idct_requested = false;
     bool idct_active = false;
+    // AVX2 is auto-enabled when the CPU reports AVX2 support and motion_comp
+    // SIMD is already active; can be force-disabled with BK2_SIMD_AVX2=0 for
+    // SSE2-only debugging.
+    bool avx2_available = false;  // CPUID reports AVX2.
+    bool avx2_requested = false;  // BK2_SIMD_AVX2 env parsed (defaults to on).
+    bool avx2_active = false;     // available && requested && consumer enabled.
 };
 
 struct Bink2SimdMotionCompCounters {

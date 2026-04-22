@@ -5,6 +5,7 @@
 #include "bink2_video.h"
 
 #include "bink2_bitstream.h"
+#include "bink2_simd_avx2.h"
 
 #include <algorithm>
 #include <array>
@@ -13,12 +14,25 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifndef BK2_HAVE_SSE2
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && \
     (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
 #define BK2_HAVE_SSE2 1
-#include <emmintrin.h>
 #else
 #define BK2_HAVE_SSE2 0
+#endif
+#endif
+
+#if BK2_HAVE_SSE2
+#include <emmintrin.h>
+#endif
+
+// Chroma saturation counters are diagnostic-only and cost a scalar per-pixel
+// loop in the SIMD chroma-IDCT-add path. Release builds default them OFF;
+// tests flip this on via the CMake BUILD_TESTING branch so the parity tests
+// in test_bink2_decoder.cpp still see nonzero counter deltas.
+#ifndef BK2_CHROMA_SAT_COUNTERS
+#define BK2_CHROMA_SAT_COUNTERS 0
 #endif
 
 namespace {
@@ -247,6 +261,9 @@ int32_t MidPred(int32_t a, int32_t b, int32_t c)
 struct Bink2SimdRuntimeCache {
     std::atomic<int> motion_comp_requested{-1};
     std::atomic<int> idct_requested{-1};
+    // BK2_SIMD_AVX2: default on (-1 means unparsed; parsed value is 0 or 1).
+    std::atomic<int> avx2_requested{-1};
+    std::atomic<int> avx2_available{-1};  // CPUID result cache.
 };
 
 static Bink2SimdRuntimeCache g_bk2_simd_runtime;
@@ -297,6 +314,50 @@ static bool Bk2SimdIdctActive()
 #else
            false;
 #endif
+}
+
+// CPUID-based AVX2 detection. Uses __builtin_cpu_supports on GCC/clang;
+// other compilers fall back to conservative "no AVX2". The check runs once
+// (plus the compiler-private init for cpu_supports) and is cached per-process.
+static bool Bk2CpuHasAvx2()
+{
+    int cached = g_bk2_simd_runtime.avx2_available.load(std::memory_order_acquire);
+    if (cached != -1) return cached != 0;
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    const int v = __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    const int v = 0;
+#endif
+    g_bk2_simd_runtime.avx2_available.store(v, std::memory_order_release);
+    return v != 0;
+}
+
+// BK2_SIMD_AVX2 env var. Unlike BK2_SIMD_MC/IDCT (opt-in), this defaults to ON
+// — AVX2 is a pure win where available and already CPUID-gated. Users debugging
+// SSE2-only regressions can force it off with BK2_SIMD_AVX2=0.
+static bool Bk2SimdAvx2Requested()
+{
+    int v = g_bk2_simd_runtime.avx2_requested.load(std::memory_order_acquire);
+    if (v != -1) return v != 0;
+    const char* e = std::getenv("BK2_SIMD_AVX2");
+    if (!e || !e[0]) {
+        v = 1;  // default on
+    } else {
+        v = (e[0] != '0') ? 1 : 0;
+    }
+    g_bk2_simd_runtime.avx2_requested.store(v, std::memory_order_release);
+    return v != 0;
+}
+
+// AVX2 is only "active" when a consumer (currently MC SIMD) is also enabled
+// — keeps the BK2_SIMD_AVX2 default-on safe for users who haven't opted into
+// any SIMD at all (the AVX2 kernels aren't reached without BK2_SIMD_MC=1).
+static bool Bk2SimdAvx2Active()
+{
+    return Bk2SimdAvx2Requested() &&
+           Bk2CpuHasAvx2() &&
+           Bk2SimdMotionCompActive();
 }
 
 static void Bk2RecordLumaMcScalarFallback(int mode)
@@ -621,8 +682,76 @@ static void Bink2gIdctPutSimd(uint8_t *dst, int stride, int16_t *block)
 #endif
 }
 
+// True when every block[i] for i != 0 is zero — the full 8x8 IDCT then
+// collapses to a uniform fill / uniform saturating-add of `(int16_t)block[0] >> 6`.
+// Inter blocks with CBP==0 for AC hit this path constantly; detection pays ~20
+// SIMD µops and skips a ~400-µop IDCT, so any DC-only fraction above a few
+// percent is a net win.
+static inline bool Bk2BlockHasOnlyDc(const int16_t* block)
+{
+#if BK2_HAVE_SSE2
+    // Row 0: clear lane 0 (the DC itself) before OR-accumulating.
+    __m128i acc = _mm_loadu_si128((const __m128i*)(block + 0));
+    const __m128i mask_row0 = _mm_set_epi16(-1, -1, -1, -1, -1, -1, -1, 0);
+    acc = _mm_and_si128(acc, mask_row0);
+    for (int i = 1; i < 8; ++i) {
+        acc = _mm_or_si128(acc,
+                           _mm_loadu_si128((const __m128i*)(block + i * 8)));
+    }
+    const __m128i zero = _mm_setzero_si128();
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(acc, zero)) == 0xFFFF;
+#else
+    for (int i = 1; i < 64; ++i) {
+        if (block[i] != 0) return false;
+    }
+    return true;
+#endif
+}
+
+// Full IDCT of a block with only block[0]=c (rest zero) collapses to a
+// uniform 8x8 tile of value `(int16_t)c >> 6` (see comment on Bk2BlockHasOnlyDc).
+static inline int32_t Bk2IdctDcOnlyValue(const int16_t* block)
+{
+    return (int32_t)block[0] >> 6;
+}
+
+static inline void Bk2IdctPutDcOnly(uint8_t* dst, int stride, const int16_t* block)
+{
+    const int32_t v = Bk2IdctDcOnlyValue(block);
+    const uint8_t u = (uint8_t)ClipInt(v, 0, 255);
+    for (int i = 0; i < 8; ++i) {
+        std::memset(dst, u, 8);
+        dst += stride;
+    }
+}
+
+static inline void Bk2IdctAddDcOnly(uint8_t* dst, int stride, const int16_t* block)
+{
+    const int32_t v32 = Bk2IdctDcOnlyValue(block);
+#if BK2_HAVE_SSE2
+    const __m128i v = _mm_set1_epi16((int16_t)v32);
+    for (int i = 0; i < 8; ++i) {
+        const __m128i sum = _mm_adds_epi16(Bk2LoadU8Row8(dst), v);
+        Bk2StorePackedRow8(dst, sum);
+        dst += stride;
+    }
+#else
+    const int16_t v = (int16_t)v32;
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            dst[j] = Clip255((int32_t)dst[j] + v);
+        }
+        dst += stride;
+    }
+#endif
+}
+
 void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
 {
+    if (Bk2BlockHasOnlyDc(block)) {
+        Bk2IdctPutDcOnly(dst, stride, block);
+        return;
+    }
     if (Bk2SimdIdctActive()) {
         Bink2gIdctPutSimd(dst, stride, block);
         return;
@@ -632,9 +761,16 @@ void Bink2gIdctPut(uint8_t *dst, int stride, int16_t *block)
 
 void PutDcOnlyBlock(uint8_t *dst, int stride, int32_t dc)
 {
-    int16_t block[64] = {};
-    block[0] = (int16_t)(dc * 8 + 32);
-    Bink2gIdctPut(dst, stride, block);
+    // Same arithmetic as running Bink2gIdctPut on a block with only block[0]
+    // set, but skips the full IDCT dispatch (which would hit the same
+    // Bk2IdctPutDcOnly fast path anyway).
+    const int16_t c = (int16_t)(dc * 8 + 32);
+    const int32_t v = (int32_t)c >> 6;
+    const uint8_t u = (uint8_t)ClipInt(v, 0, 255);
+    for (int i = 0; i < 8; ++i) {
+        std::memset(dst, u, 8);
+        dst += stride;
+    }
 }
 
 template <size_t N>
@@ -2141,6 +2277,9 @@ Bink2SimdRuntimeConfig Bink2GetSimdRuntimeConfig()
     cfg.motion_comp_active = Bk2SimdMotionCompActive();
     cfg.idct_requested = Bk2SimdIdctRequested();
     cfg.idct_active = Bk2SimdIdctActive();
+    cfg.avx2_available = Bk2CpuHasAvx2();
+    cfg.avx2_requested = Bk2SimdAvx2Requested();
+    cfg.avx2_active = Bk2SimdAvx2Active();
     return cfg;
 }
 
@@ -2148,6 +2287,8 @@ void Bink2ResetSimdRuntimeConfigForTests()
 {
     g_bk2_simd_runtime.motion_comp_requested.store(-1, std::memory_order_release);
     g_bk2_simd_runtime.idct_requested.store(-1, std::memory_order_release);
+    g_bk2_simd_runtime.avx2_requested.store(-1, std::memory_order_release);
+    // avx2_available is a CPUID cache, not env-driven — keep it across resets.
 }
 
 Bink2SimdMotionCompCounters Bink2GetSimdMotionCompCounters()
@@ -3246,6 +3387,10 @@ static void LumaMc16Simd(uint8_t* dst, int stride,
     }
 
     if (mode == 1) {
+        if (Bk2SimdAvx2Active()) {
+            Bk2LumaMc16Mode1Avx2(dst, stride, msrc, sstride);
+            return;
+        }
         for (int j = 0; j < 16; ++j) {
             __m128i m2_lo, m2_hi, m1_lo, m1_hi, p0_lo, p0_hi;
             __m128i p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
@@ -3650,6 +3795,10 @@ static void Bink2gIdctAddSimd(uint8_t* dst, int stride, int16_t* block)
 
 static void Bink2gIdctAdd(uint8_t* dst, int stride, int16_t* block)
 {
+    if (Bk2BlockHasOnlyDc(block)) {
+        Bk2IdctAddDcOnly(dst, stride, block);
+        return;
+    }
     if (Bk2SimdIdctActive()) {
         Bink2gIdctAddSimd(dst, stride, block);
         return;
@@ -3664,6 +3813,7 @@ static void Bink2gChromaIdctAddScalar(uint8_t* dst, int stride, int16_t* block,
 {
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i,     8, 0);
     for (int i = 0; i < 8; ++i) Bink2gIdct1d(block + i * 8, 1, 6);
+#if BK2_CHROMA_SAT_COUNTERS
     const int dc_b = Bk2DcBucket(dc_hint);
     const int ac_b = Bk2AcBucket(max_ac_hint);
     const int q_b  = Bk2QBucket(q_hint);
@@ -3684,6 +3834,15 @@ static void Bink2gChromaIdctAddScalar(uint8_t* dst, int stride, int16_t* block,
     g_chroma_sat.by_dc[dc_b].pixels += 64; g_chroma_sat.by_dc[dc_b].sum += block_sum;
     g_chroma_sat.by_ac[ac_b].pixels += 64; g_chroma_sat.by_ac[ac_b].sum += block_sum;
     g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
+#else
+    (void)dc_hint; (void)max_ac_hint; (void)q_hint;
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            dst[j] = Clip255((int32_t)dst[j] + block[j * 8 + i]);
+        }
+        dst += stride;
+    }
+#endif
 }
 
 static void Bink2gChromaIdctAddSimd(uint8_t* dst, int stride, int16_t* block,
@@ -3692,6 +3851,7 @@ static void Bink2gChromaIdctAddSimd(uint8_t* dst, int stride, int16_t* block,
 #if BK2_HAVE_SSE2
     __m128i rows[8];
     Bk2IdctTransformSimd(block, rows);
+#if BK2_CHROMA_SAT_COUNTERS
     const int dc_b = Bk2DcBucket(dc_hint);
     const int ac_b = Bk2AcBucket(max_ac_hint);
     const int q_b  = Bk2QBucket(q_hint);
@@ -3715,6 +3875,10 @@ static void Bink2gChromaIdctAddSimd(uint8_t* dst, int stride, int16_t* block,
     g_chroma_sat.by_ac[ac_b].pixels += 64; g_chroma_sat.by_ac[ac_b].sum += block_sum;
     g_chroma_sat.by_q[q_b].pixels  += 64; g_chroma_sat.by_q[q_b].sum  += block_sum;
 #else
+    (void)dc_hint; (void)max_ac_hint; (void)q_hint;
+    Bk2IdctAddResidualRowsSimd(dst, stride, rows);
+#endif
+#else
     Bink2gChromaIdctAddScalar(dst, stride, block, dc_hint, max_ac_hint, q_hint);
 #endif
 }
@@ -3722,6 +3886,16 @@ static void Bink2gChromaIdctAddSimd(uint8_t* dst, int stride, int16_t* block,
 static void Bink2gChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
                                 int32_t dc_hint, int32_t max_ac_hint, int32_t q_hint)
 {
+#if !BK2_CHROMA_SAT_COUNTERS
+    // DC-only fast path is byte-identical to the full IDCT-add (see
+    // Bk2BlockHasOnlyDc comment). Skipped when chroma-sat counters are on
+    // (test builds) so the full path still feeds the counters those tests
+    // assert on; with counters off, it's unconditional perf win.
+    if (Bk2BlockHasOnlyDc(block)) {
+        Bk2IdctAddDcOnly(dst, stride, block);
+        return;
+    }
+#endif
     if (Bk2SimdIdctActive()) {
         Bink2gChromaIdctAddSimd(dst, stride, block,
                                 dc_hint, max_ac_hint, q_hint);
@@ -4138,9 +4312,11 @@ static bool DecodeAndAddInterChromaPlane(Bink2BitReader& bits,
         }
         int32_t dc_val = dc[j];
         if (skip_residual_dc) dc_val = 0;
+#if BK2_CHROMA_SAT_COUNTERS
         ++g_chroma_sat.dc_blocks;
         g_chroma_sat.sum_dc += dc_val;
         g_chroma_sat.sum_abs_dc += (dc_val < 0 ? -dc_val : dc_val);
+#endif
         sub[j][0] = (int16_t)(dc_val * 8 + chroma_dc_bias);
         if (dump_chroma_tile) {
             std::fprintf(stderr,
