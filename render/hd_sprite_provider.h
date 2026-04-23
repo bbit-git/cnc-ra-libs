@@ -10,6 +10,7 @@
 
 #include "sprite_provider.h"
 
+class MegReader;
 struct HDSpriteProvider_Impl;
 
 class HDSpriteProvider : public ISpriteProvider {
@@ -25,6 +26,12 @@ public:
     bool Open(const char* meg_path);
 
     /**
+     * Attach to an already-open MEG owned by the caller (e.g. the
+     * shared hd_assets cache). The provider does not close it.
+     */
+    bool Open_Cached(MegReader* borrowed_meg);
+
+    /**
      * Load a tileset XML that maps game entity names to frame filenames.
      * @param xml_path  Path to tileset XML (e.g. TD_UNITS.XML) within the MEG
      * @return true if tileset was parsed successfully
@@ -35,6 +42,12 @@ public:
      * Load a tileset XML from a different MEG archive (e.g. CONFIG.MEG).
      */
     bool Load_Tileset_From_Meg(const char* meg_path, const char* xml_path);
+
+    /**
+     * Load a tileset XML from a borrowed MEG (e.g. CONFIG.MEG from the
+     * hd_assets cache). The MEG pointer is used only during the call.
+     */
+    bool Load_Tileset_From_Cached(MegReader* cached_meg, const char* xml_path);
 
     /**
      * Set active theater for terrain tiles (e.g. "DESERT", "TEMPERATE").

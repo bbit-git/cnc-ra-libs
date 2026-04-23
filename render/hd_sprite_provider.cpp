@@ -80,7 +80,8 @@ static uint32_t fnv1a_hash(const char* str)
 }
 
 struct HDSpriteProvider_Impl {
-    MegReader meg;
+    MegReader  owned_meg;                // used when we opened the file ourselves
+    MegReader* meg = &owned_meg;         // borrowed pointer; ==&owned_meg when owns
 
     // Tileset: name_hash → tileset entry
     std::unordered_map<uint32_t, TilesetEntry> tilesets;
@@ -112,10 +113,19 @@ HDSpriteProvider::~HDSpriteProvider()
 bool HDSpriteProvider::Open(const char* meg_path)
 {
     auto* impl = new HDSpriteProvider_Impl;
-    if (!impl->meg.Open(meg_path)) {
+    if (!impl->meg->Open(meg_path)) {
         delete impl;
         return false;
     }
+    impl_ = impl;
+    return true;
+}
+
+bool HDSpriteProvider::Open_Cached(MegReader* borrowed_meg)
+{
+    if (!borrowed_meg) return false;
+    auto* impl = new HDSpriteProvider_Impl;
+    impl->meg = borrowed_meg;  // owned_meg stays default-constructed and unused
     impl_ = impl;
     return true;
 }
@@ -245,7 +255,7 @@ static bool Parse_Tileset_From_Reader(HDSpriteProvider_Impl* impl, MegReader& me
 bool HDSpriteProvider::Load_Tileset(const char* xml_path)
 {
     if (!impl_) return false;
-    return Parse_Tileset_From_Reader(impl_, impl_->meg, xml_path);
+    return Parse_Tileset_From_Reader(impl_, *impl_->meg, xml_path);
 }
 
 bool HDSpriteProvider::Load_Tileset_From_Meg(const char* meg_path, const char* xml_path)
@@ -256,6 +266,12 @@ bool HDSpriteProvider::Load_Tileset_From_Meg(const char* meg_path, const char* x
     if (!temp_meg.Open(meg_path)) return false;
 
     return Parse_Tileset_From_Reader(impl_, temp_meg, xml_path);
+}
+
+bool HDSpriteProvider::Load_Tileset_From_Cached(MegReader* cached_meg, const char* xml_path)
+{
+    if (!impl_ || !cached_meg) return false;
+    return Parse_Tileset_From_Reader(impl_, *cached_meg, xml_path);
 }
 
 static std::string zip_path_for_entity(const std::string& entity, const std::string& category) {
@@ -273,10 +289,10 @@ static bool load_zip_for_entity(HDSpriteProvider_Impl* impl, const std::string& 
     impl->zip_cache[entity] = nullptr;
 
     std::string path = zip_path_for_entity(entity, category);
-    const MegEntry* entry = impl->meg.Find(path.c_str());
+    const MegEntry* entry = impl->meg->Find(path.c_str());
     if (entry) {
         auto zc = std::make_unique<ZipCache>();
-        zc->zip_data = impl->meg.Read_Alloc(entry, &zc->zip_size);
+        zc->zip_data = impl->meg->Read_Alloc(entry, &zc->zip_size);
         if (zc->zip_data) {
             if (zc->reader.Open(zc->zip_data, zc->zip_size)) {
                 impl->zip_cache[entity] = std::move(zc);
@@ -410,10 +426,10 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
             }
         }
 
-        const MegEntry* dds_entry = impl->meg.Find(full_path.c_str());
+        const MegEntry* dds_entry = impl->meg->Find(full_path.c_str());
         if (dds_entry) {
             size_t dds_size = 0;
-            void* dds_data = impl->meg.Read_Alloc(dds_entry, &dds_size);
+            void* dds_data = impl->meg->Read_Alloc(dds_entry, &dds_size);
             if (dds_data) {
                 int w = 0, h = 0;
                 uint8_t* pixels = DDS_Decode_RGBA(dds_data, dds_size, w, h);
@@ -429,10 +445,10 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
                     SpriteMeta meta = {};
                     meta.canvas_width = w;
                     meta.canvas_height = h;
-                    const MegEntry* meta_entry = impl->meg.Find(meta_path.c_str());
+                    const MegEntry* meta_entry = impl->meg->Find(meta_path.c_str());
                     if (meta_entry) {
                         size_t meta_size = 0;
-                        void* meta_data = impl->meg.Read_Alloc(meta_entry, &meta_size);
+                        void* meta_data = impl->meg->Read_Alloc(meta_entry, &meta_size);
                         if (meta_data) {
                             Meta_Parse(meta_data, meta_size, meta);
                             free(meta_data);
@@ -457,10 +473,10 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
         char dds_path[512];
         snprintf(dds_path, sizeof(dds_path), "%s-%04d.DDS", ts.filename_pattern.c_str(), frame);
 
-        const MegEntry* dds_entry = impl->meg.Find(dds_path);
+        const MegEntry* dds_entry = impl->meg->Find(dds_path);
         if (dds_entry) {
             size_t dds_size = 0;
-            void* dds_data = impl->meg.Read_Alloc(dds_entry, &dds_size);
+            void* dds_data = impl->meg->Read_Alloc(dds_entry, &dds_size);
             if (dds_data) {
                 int w = 0, h = 0;
                 uint8_t* pixels = DDS_Decode_RGBA(dds_data, dds_size, w, h);
@@ -472,10 +488,10 @@ bool HDSpriteProvider::Get_Frame(const void* shape_id, int frame, SpriteFrame& f
                     SpriteMeta meta = {};
                     meta.canvas_width = w;
                     meta.canvas_height = h;
-                    const MegEntry* meta_entry = impl->meg.Find(meta_path);
+                    const MegEntry* meta_entry = impl->meg->Find(meta_path);
                     if (meta_entry) {
                         size_t meta_size = 0;
-                        void* meta_data = impl->meg.Read_Alloc(meta_entry, &meta_size);
+                        void* meta_data = impl->meg->Read_Alloc(meta_entry, &meta_size);
                         if (meta_data) {
                             Meta_Parse(meta_data, meta_size, meta);
                             free(meta_data);

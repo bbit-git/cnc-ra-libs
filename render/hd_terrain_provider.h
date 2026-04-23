@@ -1,6 +1,7 @@
 #pragma once
 #include "sprite_provider.h"
 
+class MegReader;
 struct HDTerrainProvider_Impl;
 
 class HDTerrainProvider {
@@ -9,6 +10,9 @@ public:
     ~HDTerrainProvider();
 
     bool Open(const char* meg_path);
+
+    /// Attach to an already-open MEG owned by the caller; the provider does not close it.
+    bool Open_Cached(MegReader* borrowed_meg);
     void Set_Theater(const char* theater);
 
     /**

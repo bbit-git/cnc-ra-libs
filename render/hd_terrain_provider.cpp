@@ -35,7 +35,8 @@ struct CachedTerrain {
 };
 
 struct HDTerrainProvider_Impl {
-    MegReader meg;
+    MegReader  owned_meg;
+    MegReader* meg = &owned_meg;  // points at owned_meg or a borrowed MEG
     std::unordered_map<uint32_t, TerrainInfo> tiles;
     std::unordered_map<uint64_t, CachedTerrain> cache;
     std::list<uint64_t> lru_list;
@@ -55,7 +56,13 @@ HDTerrainProvider::~HDTerrainProvider() {
 }
 
 bool HDTerrainProvider::Open(const char* meg_path) {
-    return impl_->meg.Open(meg_path);
+    return impl_->meg->Open(meg_path);
+}
+
+bool HDTerrainProvider::Open_Cached(MegReader* borrowed_meg) {
+    if (!borrowed_meg) return false;
+    impl_->meg = borrowed_meg;
+    return true;
 }
 
 void HDTerrainProvider::Set_Theater(const char* theater) {
@@ -74,11 +81,11 @@ void HDTerrainProvider::Set_Theater(const char* theater) {
 
     std::string prefix = "DATA\\ART\\TEXTURES\\SRGB\\TIBERIAN_DAWN\\TERRAIN\\" + th_name + "\\";
 
-    int count = impl_->meg.Entry_Count();
+    int count = impl_->meg->Entry_Count();
     for (int i = 0; i < count; ++i) {
-        const MegEntry* entry = impl_->meg.Get_Entry(i);
+        const MegEntry* entry = impl_->meg->Get_Entry(i);
         if (!entry) continue;
-        const char* fname = impl_->meg.Get_Filename(entry->name_index);
+        const char* fname = impl_->meg->Get_Filename(entry->name_index);
         if (!fname) continue;
 
         std::string fname_s = fname;
@@ -138,11 +145,11 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     if (path_it == ts.dds_paths.end()) return false;
     const std::string& dds_path = path_it->second;
 
-    const MegEntry* dds_entry = impl_->meg.Find(dds_path.c_str());
+    const MegEntry* dds_entry = impl_->meg->Find(dds_path.c_str());
     if (!dds_entry) return false;
 
     size_t dds_size = 0;
-    void* dds_data = impl_->meg.Read_Alloc(dds_entry, &dds_size);
+    void* dds_data = impl_->meg->Read_Alloc(dds_entry, &dds_size);
     if (!dds_data) return false;
 
     int w = 0, h = 0;
@@ -158,10 +165,10 @@ bool HDTerrainProvider::Get_Tile(const char* name, int frame, SpriteFrame& out) 
     std::string meta_path = dds_path;
     size_t ext_pos = meta_path.rfind(".DDS");
     if (ext_pos != std::string::npos) meta_path.replace(ext_pos, 4, ".META");
-    const MegEntry* meta_entry = impl_->meg.Find(meta_path.c_str());
+    const MegEntry* meta_entry = impl_->meg->Find(meta_path.c_str());
     if (meta_entry) {
         size_t meta_size = 0;
-        void* meta_data = impl_->meg.Read_Alloc(meta_entry, &meta_size);
+        void* meta_data = impl_->meg->Read_Alloc(meta_entry, &meta_size);
         if (meta_data) {
             Meta_Parse(meta_data, meta_size, meta);
             free(meta_data);
