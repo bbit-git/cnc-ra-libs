@@ -21,9 +21,12 @@
 #include <vector>
 
 // Decode the video packet at `frame_index` into `out`. If the frame is an
-// inter frame, `prev` must point at the previous successfully decoded frame;
-// for keyframes it is ignored and may be null. Returns true iff the decoded
-// frame is complete.
+// inter frame, `prev` must point at the decoded frame at index
+// `frame_index - 1` specifically — not just any earlier frame. Inter decode
+// reconstructs against the immediately prior frame; passing a stale `prev`
+// produces visually corrupt output (no error, just garbage). For keyframes
+// `prev` is ignored and may be null. Returns true iff the decoded frame is
+// complete.
 bool Bink2DecodeFrameByIndex(Bink2Decoder& decoder,
                              std::size_t frame_index,
                              const Bink2DecodedFrame* prev,
