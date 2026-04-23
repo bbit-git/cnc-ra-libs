@@ -789,11 +789,13 @@ void FillPlaneWithBlocks(std::array<uint8_t, N>& plane,
     }
 }
 
-bool DecodeVlcLittleEndian(Bink2BitReader& bits,
-                           const uint16_t* codes,
-                           const uint8_t* lengths,
-                           size_t code_count,
-                           uint32_t& symbol)
+// Bit-by-bit fallback used when the lookup-table fast path cannot peek
+// enough bits (near end of stream).
+static bool DecodeVlcLittleEndianSlow(Bink2BitReader& bits,
+                                      const uint16_t* codes,
+                                      const uint8_t* lengths,
+                                      size_t code_count,
+                                      uint32_t& symbol)
 {
     uint32_t value = 0;
     for (uint32_t bit_count = 1; bit_count <= 16u; ++bit_count) {
@@ -810,6 +812,97 @@ bool DecodeVlcLittleEndian(Bink2BitReader& bits,
     }
 
     return false;
+}
+
+// Precomputed direct-lookup table for a single (codes, lengths) VLC. Indexed
+// by the first `max_len` bits of the bitstream, LSB-first. Each entry records
+// the matched symbol and its actual code length. Construction requires the
+// table to be a complete prefix code (Kraft sum == 1); the known Bink2 VLC
+// tables satisfy this.
+struct Bink2VlcLookup {
+    uint16_t symbol = 0;
+    uint8_t  length = 0; // 0 == no match
+};
+
+struct Bink2VlcTable {
+    std::array<Bink2VlcLookup, 1u << 9> entries{};
+    uint8_t max_len = 0;
+};
+
+static const Bink2VlcTable& GetOrBuildVlcTable(const uint16_t* codes,
+                                               const uint8_t* lengths,
+                                               size_t code_count)
+{
+    // Small linear cache keyed by the `codes` table address. Bink2 uses three
+    // distinct VLC tables (two AC skip tables + the MV table); capacity is
+    // sized generously above that so tests passing lookalike copies still
+    // fit. Build-on-first-use is safe because the decoder is driven from a
+    // single thread per packet. If capacity is exceeded, fall through to the
+    // slow path rather than overrun the cache.
+    static constexpr size_t kCacheCap = 16;
+    static const uint16_t* s_keys[kCacheCap] = {};
+    static Bink2VlcTable   s_tables[kCacheCap];
+    static size_t          s_count = 0;
+
+    for (size_t i = 0; i < s_count; ++i) {
+        if (s_keys[i] == codes) return s_tables[i];
+    }
+    if (s_count >= kCacheCap) {
+        // Return an empty table; caller will see max_len == 0 and fall back
+        // to the slow bit-by-bit decoder.
+        static Bink2VlcTable empty;
+        return empty;
+    }
+
+    Bink2VlcTable& t = s_tables[s_count];
+    uint8_t max_len = 0;
+    for (size_t i = 0; i < code_count; ++i) {
+        if (lengths[i] > max_len) max_len = lengths[i];
+    }
+    // Known Bink2 tables peak at 9 bits; guard against future table growth.
+    if (max_len > 9) max_len = 9;
+    t.max_len = max_len;
+    for (auto& e : t.entries) { e.length = 0; e.symbol = 0; }
+
+    for (size_t i = 0; i < code_count; ++i) {
+        const uint32_t code = codes[i];
+        const uint8_t  len  = lengths[i];
+        if (len == 0 || len > max_len) continue;
+        const uint32_t span = 1u << (max_len - len);
+        for (uint32_t hi = 0; hi < span; ++hi) {
+            const uint32_t idx = code | (hi << len);
+            t.entries[idx].symbol = (uint16_t)i;
+            t.entries[idx].length = len;
+        }
+    }
+
+    s_keys[s_count] = codes;
+    ++s_count;
+    return t;
+}
+
+bool DecodeVlcLittleEndian(Bink2BitReader& bits,
+                           const uint16_t* codes,
+                           const uint8_t* lengths,
+                           size_t code_count,
+                           uint32_t& symbol)
+{
+    const Bink2VlcTable& t = GetOrBuildVlcTable(codes, lengths, code_count);
+
+    uint32_t peek = 0;
+    if (t.max_len == 0 || !bits.Peek_Bits_LSB(t.max_len, peek)) {
+        return DecodeVlcLittleEndianSlow(bits, codes, lengths, code_count, symbol);
+    }
+
+    const Bink2VlcLookup& e = t.entries[peek];
+    if (e.length == 0) {
+        // Not reachable for a complete prefix code, but guard defensively
+        // rather than advance the bit cursor into an invalid state.
+        return DecodeVlcLittleEndianSlow(bits, codes, lengths, code_count, symbol);
+    }
+    if (!bits.Skip_Bits(e.length)) return false;
+    symbol = e.symbol;
+    return true;
 }
 
 // AC coefficient dump state (BK2_DUMP_AC_COEFS). Caller sets
@@ -2267,6 +2360,15 @@ bool DecodeTargetMacroblockBudget(Bink2BitReader& bits,
 }
 
 } // namespace
+
+bool Bink2TestDecodeVlcLittleEndian(Bink2BitReader& bits,
+                                    const uint16_t* codes,
+                                    const uint8_t* lengths,
+                                    size_t code_count,
+                                    uint32_t& symbol)
+{
+    return DecodeVlcLittleEndian(bits, codes, lengths, code_count, symbol);
+}
 
 static void Bk2DumpLumaInit();
 

@@ -296,6 +296,15 @@ void Bink2TestRunChromaIdctAdd(uint8_t* dst, int stride, int16_t* block,
                                int32_t dc_hint, int32_t max_ac_hint,
                                int32_t q_hint);
 
+// Test-only accessor for the internal VLC decoder. Exposes the lookup-table
+// fast path (with slow-path fallback near end of stream) to parity tests.
+class Bink2BitReader;
+bool Bink2TestDecodeVlcLittleEndian(Bink2BitReader& bits,
+                                    const uint16_t* codes,
+                                    const uint8_t* lengths,
+                                    size_t code_count,
+                                    uint32_t& symbol);
+
 bool Bink2PrepareFramePlan(const Bink2Header& header,
                            const Bink2PacketHeader& packet_header,
                            const std::vector<uint8_t>& packet,

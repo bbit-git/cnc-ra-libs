@@ -23,6 +23,11 @@ public:
     bool Skip_Bits(size_t count);
     void Align_Byte();
 
+    // Reads up to 24 bits LSB-first without advancing. Returns false when
+    // `count` exceeds 24 or the reader has fewer than `count` bits remaining.
+    // Used by the VLC lookup-table decoder fast path.
+    bool Peek_Bits_LSB(uint32_t count, uint32_t& value) const;
+
 private:
     const uint8_t* data_;
     size_t         size_bits_;
