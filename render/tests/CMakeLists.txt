@@ -30,6 +30,14 @@ add_executable(test_zip_reader
 )
 target_include_directories(test_zip_reader PRIVATE ${RENDER_SRC})
 
+add_executable(test_bui_reader
+    test_bui_reader.cpp
+    ${RENDER_SRC}/bui_reader.cpp
+    ${RENDER_SRC}/meg_reader.cpp
+    ${RENDER_SRC}/zip_reader.cpp
+)
+target_include_directories(test_bui_reader PRIVATE ${RENDER_SRC})
+
 # ─── Step 2: ISpriteProvider + Legacy adapter ────────────────────────
 
 add_executable(test_sprite_provider
@@ -111,6 +119,7 @@ enable_testing()
 add_test(NAME meg_reader       COMMAND test_meg_reader)
 add_test(NAME meta_parser      COMMAND test_meta_parser)
 add_test(NAME zip_reader       COMMAND test_zip_reader)
+add_test(NAME bui_reader       COMMAND test_bui_reader)
 add_test(NAME sprite_provider  COMMAND test_sprite_provider)
 add_test(NAME hd_sprite_provider COMMAND test_hd_sprite_provider)
 add_test(NAME texture_atlas    COMMAND test_texture_atlas)
