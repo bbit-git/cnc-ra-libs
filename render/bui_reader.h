@@ -78,6 +78,28 @@ struct BUIBlock {
     std::vector<size_t> layout_indices;
 };
 
+// Decoded `kind=0x0c` repeated-instance record. Each instance places one copy
+// of `child_entry` (a child BUI reference like
+// `Art\GUI\UI_SideBar_ConstructionEntry.bui`) at a normalized {x, y, w, h}
+// rectangle in its parent's coordinate space. The four floats are encoded
+// directly after a fixed `0d 10` marker that follows the kind/value u64; the
+// instance is then anchored by an embedded `kind=0x13 val=0x10` sub-header
+// (validated by the decoder, not surfaced).
+//
+// On `TACTICAL_UI.BUI` this surfaces all 10 construction-entry slot positions
+// — the cleanest numeric oracle the recon dump (B1) found. See
+// `docs/tasks/bui-non-terminal-decoder.md`.
+struct BUIInstance {
+    size_t string_index = 0;
+    size_t record_offset = 0;
+    size_t fields_offset = 0;
+    std::string child_entry;
+    float x = 0.0f;
+    float y = 0.0f;
+    float width = 0.0f;
+    float height = 0.0f;
+};
+
 struct BUILayoutRecord {
     size_t string_index = 0;
     size_t record_offset = 0;
@@ -100,6 +122,7 @@ struct BUIDocument {
     std::vector<BUIString> strings;
     std::vector<BUIBlock> blocks;
     std::vector<BUILayoutRecord> layout_records;
+    std::vector<BUIInstance> instances;
     std::string scene;
     std::vector<std::string> children;
     std::vector<std::string> normalized_children;

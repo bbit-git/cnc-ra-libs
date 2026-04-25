@@ -322,6 +322,93 @@ TEST(classify_style_default_record)
     PASS();
 }
 
+// Synthesizes a kind=0x0c repeated-instance record. Mirrors the layout
+// observed on `TACTICAL_UI.BUI` slots (B1 recon dump): size-prefixed BUI
+// reference string, kind/value u64 with kind=0x0c, marker `0d 10`, then 4
+// f32 placement floats (x, y, w, h), then an embedded `kind=0x13 val=0x10`
+// sub-header.
+static std::vector<uint8_t> build_inflated_with_instance(float x, float y,
+                                                         float w, float h)
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+    append_size_prefixed_string(data, "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+    append_u32(data, 0x0cu);   // kind=0x0c
+    append_u32(data, 0x12u);   // value (matches real records on TACTICAL_UI)
+    data.push_back(0x0d);
+    data.push_back(0x10);
+    auto append_f32 = [&](float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_u32(data, bits);
+    };
+    append_f32(x);
+    append_f32(y);
+    append_f32(w);
+    append_f32(h);
+    append_u32(data, 0x13u);   // embedded kind=0x13
+    append_u32(data, 0x10u);   // embedded val=0x10
+    data.resize(data.size() + 32, 0);
+    return data;
+}
+
+TEST(decode_instance_record)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(
+        build_inflated_with_instance(0.5f, 0.14286f, 0.5f, 0.14286f));
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+
+    EXPECT_EQ(doc.instances.size(), static_cast<size_t>(1));
+    const BUIInstance& inst = doc.instances[0];
+    EXPECT_STR_EQ(inst.child_entry.c_str(),
+                  "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+    EXPECT_NEAR(inst.x,      0.5f,     0.0001f);
+    EXPECT_NEAR(inst.y,      0.14286f, 0.0001f);
+    EXPECT_NEAR(inst.width,  0.5f,     0.0001f);
+    EXPECT_NEAR(inst.height, 0.14286f, 0.0001f);
+
+    PASS();
+}
+
+// A kind=0x0c record without the `0d 10` marker must be rejected. Builds an
+// otherwise-valid instance record and zeroes the marker bytes.
+static std::vector<uint8_t> build_inflated_with_bad_instance_marker()
+{
+    std::vector<uint8_t> data = build_inflated_with_instance(0.5f, 0.5f, 0.5f, 0.5f);
+    // Locate the marker bytes by searching for `0d 10` immediately after a
+    // `0c 00 00 00 12 00 00 00` (kind/val) sequence.
+    for (size_t i = 0; i + 10 < data.size(); ++i) {
+        if (data[i] == 0x0c && data[i + 1] == 0x00 && data[i + 2] == 0x00
+            && data[i + 3] == 0x00 && data[i + 4] == 0x12) {
+            data[i + 8] = 0x00;
+            data[i + 9] = 0x00;
+            break;
+        }
+    }
+    return data;
+}
+
+TEST(reject_instance_without_marker)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_bad_instance_marker());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.instances.size(), static_cast<size_t>(0));
+
+    PASS();
+}
+
 int main()
 {
     return RUN_TESTS();

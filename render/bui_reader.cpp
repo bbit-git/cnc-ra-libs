@@ -661,6 +661,86 @@ static std::vector<BUILayoutRecord> extract_layout_records(const std::vector<uin
     return out;
 }
 
+// Decode every `kind=0x0c` repeated-instance record. Layout (validated against
+// the B1 recon dump on `TACTICAL_UI.BUI`):
+//
+//   <kind=0x0c><value u32>
+//   0x0d 0x10                       // fixed marker
+//   f32 x                           // top-left x in normalized parent coords
+//   f32 y                           // top-left y
+//   f32 w                           // width
+//   f32 h                           // height
+//   <kind=0x13><value=0x10>         // embedded child header (validated)
+//
+// Anything that doesn't match the marker + sub-header is rejected; the
+// classification is conservative so misclassified strings don't generate
+// spurious instances.
+static std::vector<BUIInstance> extract_instances(const std::vector<uint8_t>& data,
+                                                  const BUIDocument& doc)
+{
+    std::vector<BUIInstance> out;
+
+    constexpr uint32_t KIND_INSTANCE   = 0x0cu;
+    constexpr uint8_t  MARKER_LO       = 0x0du;
+    constexpr uint8_t  MARKER_HI       = 0x10u;
+    constexpr uint32_t KIND_GROUP      = 0x13u;
+    constexpr uint32_t VALUE_GROUP     = 0x10u;
+    constexpr size_t   MARKER_BYTES    = 2u;
+    constexpr size_t   FLOAT_FIELD     = sizeof(float);
+    constexpr size_t   FLOAT_FIELDS    = 4u;
+    constexpr size_t   GROUP_HDR_BYTES = sizeof(uint32_t) * 2u;
+    constexpr size_t   PAYLOAD_BYTES   =
+        MARKER_BYTES + FLOAT_FIELDS * FLOAT_FIELD + GROUP_HDR_BYTES;
+
+    for (size_t i = 0; i < doc.strings.size(); ++i) {
+        const BUIString& s = doc.strings[i];
+        if (!s.post_name_kind_valid) continue;
+        if (s.post_name_kind != KIND_INSTANCE) continue;
+
+        // Payload begins immediately after the kind/value u64 that itself
+        // follows the string text (and any trailing '+').
+        const size_t payload =
+            s.offset + s.declared_length + (s.trailing_plus ? 1u : 0u) + 8u;
+        if (payload + PAYLOAD_BYTES > data.size()) continue;
+
+        const uint8_t* f = data.data() + payload;
+        if (f[0] != MARKER_LO || f[1] != MARKER_HI) continue;
+
+        const float x = read_f32_le(f + MARKER_BYTES + 0 * FLOAT_FIELD);
+        const float y = read_f32_le(f + MARKER_BYTES + 1 * FLOAT_FIELD);
+        const float w = read_f32_le(f + MARKER_BYTES + 2 * FLOAT_FIELD);
+        const float h = read_f32_le(f + MARKER_BYTES + 3 * FLOAT_FIELD);
+        if (!std::isfinite(x) || !std::isfinite(y)
+            || !std::isfinite(w) || !std::isfinite(h)) {
+            continue;
+        }
+        // Width/height are normalized fractions. Negative or > 1.5
+        // (small slack for >1 pivots seen on cropped instances) is almost
+        // certainly garbage rather than a real placement.
+        if (w <= 0.0f || h <= 0.0f || w > 1.5f || h > 1.5f) continue;
+        if (x < -1.0f || x > 2.0f || y < -1.0f || y > 2.0f) continue;
+
+        const size_t group = payload + MARKER_BYTES + FLOAT_FIELDS * FLOAT_FIELD;
+        if (read_u32_le(data.data() + group) != KIND_GROUP) continue;
+        if (read_u32_le(data.data() + group + sizeof(uint32_t)) != VALUE_GROUP) continue;
+
+        BUIInstance inst;
+        inst.string_index = i;
+        inst.record_offset = s.record_offset;
+        inst.fields_offset = payload;
+        inst.child_entry = is_child_bui_ref(s.text)
+            ? BUI_Normalize_Entry_Path(s.text)
+            : s.text;
+        inst.x = x;
+        inst.y = y;
+        inst.width = w;
+        inst.height = h;
+        out.push_back(std::move(inst));
+    }
+
+    return out;
+}
+
 static void classify_block_strings(BUIBlock& block, const BUIDocument& doc,
                                    const BUIReadOptions& options)
 {
@@ -838,6 +918,7 @@ bool BUIReader::Read_Memory(const void* data, size_t size, const std::string& en
     }
     classify_strings(out, options);
     out.layout_records = extract_layout_records(inflated, out);
+    out.instances = extract_instances(inflated, out);
     build_blocks(out, options);
     return true;
 }
