@@ -376,6 +376,71 @@ TEST(decode_instance_record)
     PASS();
 }
 
+// Synthesizes a parent terminal layout record + a nested kind=0x0c instance.
+// Verifies the instance's normalized xywh resolves to absolute pixel coords
+// inside the parent's box.
+static std::vector<uint8_t> build_inflated_with_nested_instance()
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+    append_size_prefixed_string(data, "ParentControl");
+    // Terminal layout block for the parent control: x=100, y=200,
+    // w=400, h=300, pivot=(0.5,0.5).
+    append_u32(data, 4u);          // tag X
+    append_u32(data, 100u);
+    append_u32(data, 5u);          // tag Y
+    append_u32(data, 200u);
+    data.push_back(6); data.push_back(2); append_u16(data, 400u);
+    data.push_back(7); data.push_back(2); append_u16(data, 300u);
+    data.push_back(8); data.push_back(8);
+    const uint32_t half = 0x3f000000u;
+    append_u32(data, half);
+    append_u32(data, half);
+    // Now the nested kind=0x0c instance, normalized to (0.25, 0.5, 0.5, 0.5).
+    append_size_prefixed_string(data, "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+    append_u32(data, 0x0cu);
+    append_u32(data, 0x12u);
+    data.push_back(0x0d);
+    data.push_back(0x10);
+    auto append_f32 = [&](float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_u32(data, bits);
+    };
+    append_f32(0.25f);
+    append_f32(0.5f);
+    append_f32(0.5f);
+    append_f32(0.5f);
+    append_u32(data, 0x13u);
+    append_u32(data, 0x10u);
+    data.resize(data.size() + 32, 0);
+    return data;
+}
+
+TEST(decode_instance_parent_pixel_coords)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_nested_instance());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.layout_records.size(), static_cast<size_t>(1));
+    EXPECT_EQ(doc.instances.size(), static_cast<size_t>(1));
+
+    const BUIInstance& inst = doc.instances[0];
+    EXPECT_STR_EQ(inst.parent_name.c_str(), "ParentControl");
+    // (0.25, 0.5, 0.5, 0.5) inside (100, 200, 400, 300) → (200, 350, 200, 150)
+    EXPECT_EQ(inst.pixel_x,      200);
+    EXPECT_EQ(inst.pixel_y,      350);
+    EXPECT_EQ(inst.pixel_width,  200);
+    EXPECT_EQ(inst.pixel_height, 150);
+
+    PASS();
+}
+
 // A kind=0x0c record without the `0d 10` marker must be rejected. Builds an
 // otherwise-valid instance record and zeroes the marker bytes.
 static std::vector<uint8_t> build_inflated_with_bad_instance_marker()

@@ -940,6 +940,43 @@ bool BUIReader::Read_Memory(const void* data, size_t size, const std::string& en
     classify_strings(out, options);
     out.layout_records = extract_layout_records(inflated, out);
     out.instances = extract_instances(inflated, out);
+
+    // Resolve each instance's parent layout record: the most recent
+    // BUILayoutRecord whose record_offset precedes the instance. The
+    // instance's normalized xywh is then multiplied through the parent's
+    // pixel bounding box to get absolute coordinates.
+    //
+    // Many scenes have no preceding terminal layout record for some
+    // instances (e.g. `TACTICAL_UI.BUI` declares its whole-canvas record
+    // only at the end of the payload, after every kind=0x0c). For those
+    // instances we leave `parent_name` empty rather than fabricating a
+    // canvas-wide parent: the construction-entry grid is normalized to a
+    // sub-container whose extent isn't decoded yet (B3), and folding it
+    // through the scene canvas would emit misleading pixel coords.
+    if (!out.layout_records.empty()) {
+        for (BUIInstance& inst : out.instances) {
+            const BUILayoutRecord* parent = nullptr;
+            size_t parent_index = 0;
+            for (size_t li = 0; li < out.layout_records.size(); ++li) {
+                const BUILayoutRecord& lr = out.layout_records[li];
+                if (lr.record_offset >= inst.record_offset) break;
+                parent = &lr;
+                parent_index = li;
+            }
+            if (!parent) continue;
+            inst.parent_layout_index = parent_index;
+            inst.parent_name = parent->name;
+            inst.pixel_x = parent->x + static_cast<int32_t>(
+                inst.x * static_cast<float>(parent->width));
+            inst.pixel_y = parent->y + static_cast<int32_t>(
+                inst.y * static_cast<float>(parent->height));
+            inst.pixel_width = static_cast<int32_t>(
+                inst.width * static_cast<float>(parent->width));
+            inst.pixel_height = static_cast<int32_t>(
+                inst.height * static_cast<float>(parent->height));
+        }
+    }
+
     build_blocks(out, options);
     return true;
 }

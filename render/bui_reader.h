@@ -104,6 +104,17 @@ struct BUIInstance {
     float y = 0.0f;
     float width = 0.0f;
     float height = 0.0f;
+
+    // Resolved parent: the closest terminal layout record (BUILayoutRecord)
+    // whose `record_offset < instance.record_offset`. The instance's xywh is
+    // normalized to that record's pixel bounding box. `parent_layout_index`
+    // is `(size_t)-1` if no preceding layout record exists in the document.
+    size_t parent_layout_index = static_cast<size_t>(-1);
+    std::string parent_name;
+    int32_t pixel_x = 0;
+    int32_t pixel_y = 0;
+    int32_t pixel_width = 0;
+    int32_t pixel_height = 0;
 };
 
 struct BUILayoutRecord {
