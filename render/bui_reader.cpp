@@ -762,6 +762,119 @@ static std::vector<BUIInstance> extract_instances(const std::vector<uint8_t>& da
     return out;
 }
 
+// Decodes the stable prefix of a `kind=0x13` named control record. Layout
+// (validated against `Cost_Text` and `Units_Group` on `TACTICAL_UI.BUI`):
+//
+//   <kind=0x13><val=0x10>
+//   00 × 12                              // vec3 zeros
+//   00 00 80 3f                          // f32 1.0
+//   <u32 0x14> <u32 0x02>                // magic
+//   00 00 <u32 0x27> <u32 0>             // magic (2 leading zero bytes)
+//   <u32 0x01>                           // magic
+//   <u32 0x80000002>                     // type-2 marker
+//   <u32 0x02> <u32 0x06>                // ?
+//   <byte 0x03> <byte 0x04> <u32>        // tag 3, type 4 (u32) child count
+//   ... variable per-record body ...
+//
+// The fixed-position triples (tag 1 ID, tag 2 vec4, tag 3 vec4) appear at
+// known offsets only on records that start with the canonical 32-byte
+// header — which excludes the few kind=0x13 records that have a different
+// shape. Records that don't match the header magic are skipped silently.
+static std::vector<BUIControlHeader> extract_control_headers(
+    const std::vector<uint8_t>& data, const BUIDocument& doc)
+{
+    std::vector<BUIControlHeader> out;
+
+    constexpr size_t   FIXED_HEADER_BYTES = 32u;
+    // Magic bytes at fixed offsets inside the 32-byte header. These weed out
+    // the small minority of kind=0x13 records whose payload doesn't follow
+    // this layout (e.g. records that are themselves embedded inside
+    // kind=0x0c instances).
+    const uint32_t magic_a = 0x14u;          // bytes 16..19
+    const uint32_t magic_b = 0x02u;          // bytes 20..23
+    const uint32_t magic_c = 0x27u;          // bytes 26..29 (unaligned u32)
+
+    for (size_t i = 0; i < doc.strings.size(); ++i) {
+        const BUIString& s = doc.strings[i];
+        if (!s.post_name_kind_valid) continue;
+        if (s.post_name_kind != 0x13u) continue;
+        if (s.post_name_value != 0x10u) continue;
+
+        const size_t header_off =
+            s.offset + s.declared_length + (s.trailing_plus ? 1u : 0u) + 8u;
+        // Need 32 header bytes plus tag1(6) + tag2(18) + tag3(18) = 74 total.
+        if (header_off + FIXED_HEADER_BYTES + 64 > data.size()) continue;
+
+        const uint8_t* p = data.data() + header_off;
+
+        // Header magic check.
+        if (read_u32_le(p + 16) != magic_a) continue;
+        if (read_u32_le(p + 20) != magic_b) continue;
+        if (read_u32_le(p + 26) != magic_c) continue;
+
+        // Walk the tag triples. The first three positions vary in offset
+        // because the header tail has a few additional u32s past the fixed
+        // 32 bytes. Scan forward up to a safety limit, looking for
+        // `01 04 <u32>` then `02 10 <16 bytes>` then `03 10 <16 bytes>`.
+        constexpr size_t SCAN_MAX = 256u;
+        const size_t scan_end =
+            std::min(data.size(), header_off + FIXED_HEADER_BYTES + SCAN_MAX);
+
+        size_t cursor = header_off + FIXED_HEADER_BYTES;
+        bool got_tag1 = false, got_tag2 = false, got_tag3 = false;
+        BUIControlHeader hdr;
+        hdr.string_index = i;
+        hdr.header_offset = header_off;
+
+        while (cursor + 6 <= scan_end && !(got_tag1 && got_tag2 && got_tag3)) {
+            const uint8_t tag = data[cursor];
+            const uint8_t type = data[cursor + 1];
+            if (tag == 0x01 && type == 0x04 && !got_tag1) {
+                hdr.uid = read_u32_le(data.data() + cursor + 2);
+                cursor += 6;
+                got_tag1 = true;
+                continue;
+            }
+            if (tag == 0x02 && type == 0x10 && !got_tag2) {
+                if (cursor + 2 + 16 > scan_end) break;
+                for (int k = 0; k < 4; ++k) {
+                    hdr.tag2[k] = read_f32_le(data.data() + cursor + 2 + 4 * k);
+                }
+                cursor += 18;
+                got_tag2 = true;
+                continue;
+            }
+            if (tag == 0x03 && type == 0x10 && !got_tag3) {
+                if (cursor + 2 + 16 > scan_end) break;
+                for (int k = 0; k < 4; ++k) {
+                    hdr.tag3[k] = read_f32_le(data.data() + cursor + 2 + 4 * k);
+                }
+                cursor += 18;
+                got_tag3 = true;
+                continue;
+            }
+            ++cursor;
+        }
+
+        if (!got_tag1 || !got_tag2) continue;
+
+        // Tag-2 interpretation: leaves carry an absolute (or normalized) bbox
+        // with non-zero left/top in real cases; grid containers use (0, 0)
+        // for the first two components and the per-cell step for w/h.
+        if (hdr.tag2[0] == 0.0f && hdr.tag2[1] == 0.0f
+            && hdr.tag2[2] > 0.0f && hdr.tag2[3] > 0.0f) {
+            hdr.tag2_kind = BUIControlHeader::Tag2Kind::GridStep;
+        } else if (std::isfinite(hdr.tag2[2]) && std::isfinite(hdr.tag2[3])
+                   && hdr.tag2[2] > 0.0f && hdr.tag2[3] > 0.0f) {
+            hdr.tag2_kind = BUIControlHeader::Tag2Kind::Bbox;
+        }
+
+        out.push_back(std::move(hdr));
+    }
+
+    return out;
+}
+
 static void classify_block_strings(BUIBlock& block, const BUIDocument& doc,
                                    const BUIReadOptions& options)
 {
@@ -940,6 +1053,7 @@ bool BUIReader::Read_Memory(const void* data, size_t size, const std::string& en
     classify_strings(out, options);
     out.layout_records = extract_layout_records(inflated, out);
     out.instances = extract_instances(inflated, out);
+    out.control_headers = extract_control_headers(inflated, out);
 
     // Resolve each instance's parent layout record: the most recent
     // BUILayoutRecord whose record_offset precedes the instance. The

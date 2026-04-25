@@ -441,6 +441,71 @@ TEST(decode_instance_parent_pixel_coords)
     PASS();
 }
 
+// Synthesizes a kind=0x13 named control with the canonical 32-byte fixed
+// header followed by tag-1 (uid u32), tag-2 (vec4), tag-3 (vec4) triples,
+// matching the layout decoded from real BUIs. Verifies the extractor
+// produces a populated `BUIControlHeader` with the right uid and vec4s.
+static std::vector<uint8_t> build_inflated_with_control_header()
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+    // kind=0x13 named control, val=0x10
+    append_size_prefixed_string(data, "SyntheticControl");
+    append_u32(data, 0x13u);
+    append_u32(data, 0x10u);
+    // 32-byte fixed header: 12 zero bytes + f32(1.0) + magic words.
+    for (int i = 0; i < 12; ++i) data.push_back(0);
+    append_u32(data, 0x3f800000u);    // f32 1.0
+    append_u32(data, 0x14u);
+    append_u32(data, 0x02u);
+    data.push_back(0);
+    data.push_back(0);
+    append_u32(data, 0x27u);          // unaligned u32 magic
+    append_u32(data, 0x00u);
+    // Now the tag triples.
+    data.push_back(0x01); data.push_back(0x04); append_u32(data, 0xdeadbeefu);
+    data.push_back(0x02); data.push_back(0x10);
+    auto append_f32 = [&](float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_u32(data, bits);
+    };
+    append_f32(0.10f);
+    append_f32(0.20f);
+    append_f32(0.30f);
+    append_f32(0.40f);
+    data.push_back(0x03); data.push_back(0x10);
+    append_f32(1.0f);
+    append_f32(1.0f);
+    append_f32(1.0f);
+    append_f32(1.0f);
+    data.resize(data.size() + 32, 0);
+    return data;
+}
+
+TEST(decode_kind_13_control_header)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_control_header());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.control_headers.size(), static_cast<size_t>(1));
+    const BUIControlHeader& h = doc.control_headers[0];
+    EXPECT_EQ(h.uid, 0xdeadbeefu);
+    EXPECT_NEAR(h.tag2[0], 0.10f, 0.0001f);
+    EXPECT_NEAR(h.tag2[1], 0.20f, 0.0001f);
+    EXPECT_NEAR(h.tag2[2], 0.30f, 0.0001f);
+    EXPECT_NEAR(h.tag2[3], 0.40f, 0.0001f);
+    // Bbox interpretation: (0.1, 0.2) is non-zero → leaf bbox.
+    EXPECT_TRUE(h.tag2_kind == BUIControlHeader::Tag2Kind::Bbox);
+
+    PASS();
+}
+
 // A kind=0x0c record without the `0d 10` marker must be rejected. Builds an
 // otherwise-valid instance record and zeroes the marker bytes.
 static std::vector<uint8_t> build_inflated_with_bad_instance_marker()

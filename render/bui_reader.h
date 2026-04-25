@@ -130,6 +130,39 @@ struct BUILayoutRecord {
     float pivot_y = 0.0f;
 };
 
+// Decoded prefix of a `kind=0x13` named control record. Every kind=0x13 on
+// the BUIs we've inspected starts with a fixed 32-byte header
+// (vec3-zeros + f32 1.0 + a few u32 magic words), followed by tag/type/value
+// triples. The first three triples are stable enough to decode:
+//
+//   tag 0x01, type 0x04 (u32): unique control ID (probably FNV hash of name)
+//   tag 0x02, type 0x10 (vec4 f32):
+//       leaves   — normalized (x, y, w, h) bbox in parent space
+//       grid containers — (0, 0, child_step_x, child_step_y)
+//   tag 0x03, type 0x10 (vec4 f32): scale/tint, always (1,1,1,1) so far
+//
+// `tag2_kind` tells callers which interpretation to apply. `Bbox` for leaves
+// (Cost_Text → (0.0254, 0.0568, 0.2203, 0.2841)), `GridStep` for containers
+// whose first two components are zero (Units_Group → (0, 0, 0.5, 0.1429)).
+//
+// The "container's outer extent" is not encoded here; that lives in some
+// record kind we haven't isolated. See
+// `docs/tasks/bui-non-terminal-decoder.md`.
+struct BUIControlHeader {
+    enum class Tag2Kind {
+        Unknown,
+        Bbox,
+        GridStep
+    };
+
+    size_t string_index = 0;
+    size_t header_offset = 0;
+    uint32_t uid = 0;
+    float tag2[4] = {0, 0, 0, 0};
+    float tag3[4] = {0, 0, 0, 0};
+    Tag2Kind tag2_kind = Tag2Kind::Unknown;
+};
+
 struct BUIDocument {
     std::string entry;
     BUIHeader header;
@@ -140,6 +173,7 @@ struct BUIDocument {
     std::vector<BUIBlock> blocks;
     std::vector<BUILayoutRecord> layout_records;
     std::vector<BUIInstance> instances;
+    std::vector<BUIControlHeader> control_headers;
     std::string scene;
     std::vector<std::string> children;
     std::vector<std::string> normalized_children;
