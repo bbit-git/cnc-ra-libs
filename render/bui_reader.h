@@ -94,6 +94,12 @@ struct BUIInstance {
     size_t record_offset = 0;
     size_t fields_offset = 0;
     std::string child_entry;
+    // Sibling slot label observed immediately before the instance record.
+    // Real BUIs emit a `kind=0x0b val=0x2a` size-prefixed string right ahead
+    // of every `kind=0x0c` instance whose value is the placement slot name
+    // (e.g. `Column1_0`, `UnitButton_3`). Optional — left empty if none was
+    // found within the conservative search window.
+    std::string slot_name;
     float x = 0.0f;
     float y = 0.0f;
     float width = 0.0f;

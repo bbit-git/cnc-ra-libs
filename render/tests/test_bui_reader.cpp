@@ -394,6 +394,52 @@ static std::vector<uint8_t> build_inflated_with_bad_instance_marker()
     return data;
 }
 
+// Synthesizes the layout observed on `TACTICAL_UI.BUI`: a kind=0x0b slot label
+// string immediately followed by a kind=0x0c instance record. Verifies the
+// instance picks up the label.
+static std::vector<uint8_t> build_inflated_with_labeled_instance()
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+    append_size_prefixed_string(data, "Column1_0");
+    append_u32(data, 0x0bu);   // kind=0x0b
+    append_u32(data, 0x2au);   // value=0x2a (slot label)
+    append_size_prefixed_string(data, "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+    append_u32(data, 0x0cu);
+    append_u32(data, 0x12u);
+    data.push_back(0x0d);
+    data.push_back(0x10);
+    auto append_f32 = [&](float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_u32(data, bits);
+    };
+    append_f32(0.5f);
+    append_f32(0.25f);
+    append_f32(0.5f);
+    append_f32(0.25f);
+    append_u32(data, 0x13u);
+    append_u32(data, 0x10u);
+    data.resize(data.size() + 32, 0);
+    return data;
+}
+
+TEST(decode_instance_slot_label)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_labeled_instance());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.instances.size(), static_cast<size_t>(1));
+    EXPECT_STR_EQ(doc.instances[0].slot_name.c_str(), "Column1_0");
+
+    PASS();
+}
+
 TEST(reject_instance_without_marker)
 {
     const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_bad_instance_marker());

@@ -735,6 +735,27 @@ static std::vector<BUIInstance> extract_instances(const std::vector<uint8_t>& da
         inst.y = y;
         inst.width = w;
         inst.height = h;
+
+        // Walk back to the closest preceding string. On real BUIs the slot
+        // label is the immediate predecessor — anything that isn't directly
+        // adjacent is almost certainly an unrelated record, so the window is
+        // tight to avoid spurious matches.
+        constexpr uint32_t KIND_SLOT_LABEL  = 0x0bu;
+        constexpr uint32_t VALUE_SLOT_LABEL = 0x2au;
+        constexpr size_t   SLOT_LABEL_MAX_GAP = 64u;
+        for (size_t back = i; back > 0; --back) {
+            const BUIString& prev = doc.strings[back - 1];
+            if (prev.record_offset >= s.record_offset) continue;
+            if (s.record_offset - prev.record_offset > SLOT_LABEL_MAX_GAP) break;
+            if (!prev.post_name_kind_valid) break;
+            if (prev.post_name_kind != KIND_SLOT_LABEL
+                || prev.post_name_value != VALUE_SLOT_LABEL) {
+                break;
+            }
+            inst.slot_name = prev.text;
+            break;
+        }
+
         out.push_back(std::move(inst));
     }
 
