@@ -257,14 +257,7 @@ static bool is_likely_texture_token(const std::string& s, const std::string& sce
         return true;
     }
 
-    if (s.size() >= 3 && s[0] == 'u' && s[1] == 'i' && s[2] == '_') return true;
-
-    if (starts_with_ci(u, "UI_POWERBAR_")
-        || starts_with_ci(u, "UI_SIDEBAR_POWERSEGMENT_")
-        || starts_with_ci(u, "UI_TACTICAL_")
-        || starts_with_ci(u, "UI_TATICAL_")) {
-        return true;
-    }
+    if (starts_with_ci(u, "UI_")) return true;
 
     return false;
 }
@@ -349,12 +342,6 @@ static bool inflate_zlib(const uint8_t* data, size_t size,
 
     for (;;) {
         const size_t old_size = out.size();
-        if (old_size + chunk > max_inflated_bytes && old_size >= max_inflated_bytes) {
-            error = "inflated payload exceeded safety limit";
-            mz_inflateEnd(&stream);
-            return false;
-        }
-
         out.resize(old_size + chunk);
         stream.next_out = out.data() + old_size;
         stream.avail_out = static_cast<unsigned int>(chunk);
@@ -455,9 +442,13 @@ static std::vector<BUIString> extract_printable_strings(const std::vector<uint8_
             }
         }
 
+        // Tagged: require a small nonzero tag (single byte) and that the
+        // post-name kind/value bytes exist. A wider tag check would let any
+        // stray scalar two bytes upstream flip the encoding and skew block
+        // anchoring; in practice real tags are small type IDs.
         if (entry.encoding == BUIString::Encoding::Unknown && i >= 4) {
             const uint16_t tag = read_u16_le(data.data() + i - 4);
-            if (tag != 0) {
+            if (tag != 0 && tag <= 0xff && entry.post_name_kind_valid) {
                 entry.record_offset = i - 4;
                 entry.tag = tag;
                 entry.encoding = BUIString::Encoding::Tagged;
@@ -574,9 +565,50 @@ static void classify_strings(BUIDocument& doc, const BUIReadOptions& options)
     }
 }
 
+// Terminal layout-record field block, in order, immediately past the string
+// bytes of a control name. Field tags are the leading byte (or first u32 for
+// the i32 fields). Scalar-type byte (`2` = u16, `8` = vec2 f32) is encoded
+// inline. See docs/tasks/remastered-bui-layout-inspector.md for the trace
+// data this was derived from.
+namespace bui_layout_field {
+    constexpr size_t FIELD_X_TAG     = 0;   // u32 == 4
+    constexpr size_t FIELD_X_VALUE   = 4;   // i32 x
+    constexpr size_t FIELD_Y_TAG     = 8;   // u32 == 5
+    constexpr size_t FIELD_Y_VALUE   = 12;  // i32 y
+    constexpr size_t FIELD_W_TAG     = 16;  // u8  == 6
+    constexpr size_t FIELD_W_TYPE    = 17;  // u8  == 2 (u16 scalar)
+    constexpr size_t FIELD_W_VALUE   = 18;  // u16 width
+    constexpr size_t FIELD_H_TAG     = 20;  // u8  == 7
+    constexpr size_t FIELD_H_TYPE    = 21;  // u8  == 2
+    constexpr size_t FIELD_H_VALUE   = 22;  // u16 height
+    constexpr size_t FIELD_PIVOT_TAG  = 24; // u8  == 8
+    constexpr size_t FIELD_PIVOT_TYPE = 25; // u8  == 8 (vec2 f32)
+    constexpr size_t FIELD_PIVOT_X   = 26;  // f32 pivot.x
+    constexpr size_t FIELD_PIVOT_Y   = 30;  // f32 pivot.y
+    constexpr size_t BLOCK_SIZE      = 34;
+
+    constexpr uint32_t TAG_X = 4;
+    constexpr uint32_t TAG_Y = 5;
+    constexpr uint8_t  TAG_W = 6;
+    constexpr uint8_t  TAG_H = 7;
+    constexpr uint8_t  TAG_PIVOT = 8;
+    constexpr uint8_t  TYPE_U16  = 2;
+    constexpr uint8_t  TYPE_VEC2 = 8;
+
+    // Sanity bound for width/height. Real BUI fields are sub-2K screen units;
+    // anything past this is almost certainly a misclassified control name
+    // landing on garbage bytes.
+    constexpr int32_t MAX_DIM = 16384;
+    // Pivot is normalised in [0,1] for almost every record we have observed;
+    // allow slack for negative anchors and overshoots without admitting NaN-
+    // adjacent garbage.
+    constexpr float PIVOT_LIMIT = 8.0f;
+}
+
 static std::vector<BUILayoutRecord> extract_layout_records(const std::vector<uint8_t>& data,
                                                            const BUIDocument& doc)
 {
+    using namespace bui_layout_field;
     std::vector<BUILayoutRecord> out;
 
     for (size_t i = 0; i < doc.strings.size(); ++i) {
@@ -584,38 +616,41 @@ static std::vector<BUILayoutRecord> extract_layout_records(const std::vector<uin
         if (s.encoding != BUIString::Encoding::SizePrefixed) continue;
         if (!is_likely_control_name(s.text, doc.scene)) continue;
 
-        const size_t fields_offset = s.offset + s.declared_length;
-        if (fields_offset + 34 > data.size()) continue;
+        // `fields_block` is the byte offset of the field block that immediately
+        // follows the string text (NOT a header-relative length — `s.offset` is
+        // the absolute position of the text inside the inflated payload, and
+        // `s.declared_length` is the text byte count).
+        const size_t fields_block = s.offset + s.declared_length;
+        if (fields_block + BLOCK_SIZE > data.size()) continue;
 
-        // Terminal layout records observed in sidebar/radar BUI files encode:
-        // u32 field 4 + i32 x, u32 field 5 + i32 y, compact u16 width/height,
-        // then field 8 with a vec2 pivot.
-        if (read_u32_le(data.data() + fields_offset) != 4) continue;
-        if (read_u32_le(data.data() + fields_offset + 8) != 5) continue;
-        if (data[fields_offset + 16] != 6 || data[fields_offset + 17] != 2) continue;
-        if (data[fields_offset + 20] != 7 || data[fields_offset + 21] != 2) continue;
-        if (data[fields_offset + 24] != 8 || data[fields_offset + 25] != 8) continue;
+        const uint8_t* f = data.data() + fields_block;
 
-        const int32_t width = static_cast<int32_t>(
-            read_u16_le(data.data() + fields_offset + 18));
-        const int32_t height = static_cast<int32_t>(
-            read_u16_le(data.data() + fields_offset + 22));
+        if (read_u32_le(f + FIELD_X_TAG) != TAG_X) continue;
+        if (read_u32_le(f + FIELD_Y_TAG) != TAG_Y) continue;
+        if (f[FIELD_W_TAG] != TAG_W || f[FIELD_W_TYPE] != TYPE_U16) continue;
+        if (f[FIELD_H_TAG] != TAG_H || f[FIELD_H_TYPE] != TYPE_U16) continue;
+        if (f[FIELD_PIVOT_TAG] != TAG_PIVOT || f[FIELD_PIVOT_TYPE] != TYPE_VEC2) continue;
+
+        const int32_t width  = static_cast<int32_t>(read_u16_le(f + FIELD_W_VALUE));
+        const int32_t height = static_cast<int32_t>(read_u16_le(f + FIELD_H_VALUE));
         if (width <= 0 || height <= 0) continue;
+        if (width > MAX_DIM || height > MAX_DIM) continue;
 
-        const float pivot_x = read_f32_le(data.data() + fields_offset + 26);
-        const float pivot_y = read_f32_le(data.data() + fields_offset + 30);
+        const float pivot_x = read_f32_le(f + FIELD_PIVOT_X);
+        const float pivot_y = read_f32_le(f + FIELD_PIVOT_Y);
         if (!std::isfinite(pivot_x) || !std::isfinite(pivot_y)) continue;
-        if (pivot_x < -8.0f || pivot_x > 8.0f || pivot_y < -8.0f || pivot_y > 8.0f) {
+        if (pivot_x < -PIVOT_LIMIT || pivot_x > PIVOT_LIMIT
+            || pivot_y < -PIVOT_LIMIT || pivot_y > PIVOT_LIMIT) {
             continue;
         }
 
         BUILayoutRecord rec;
         rec.string_index = i;
         rec.record_offset = s.record_offset;
-        rec.fields_offset = fields_offset;
+        rec.fields_offset = fields_block;
         rec.name = s.text;
-        rec.x = read_i32_le(data.data() + fields_offset + 4);
-        rec.y = read_i32_le(data.data() + fields_offset + 12);
+        rec.x = read_i32_le(f + FIELD_X_VALUE);
+        rec.y = read_i32_le(f + FIELD_Y_VALUE);
         rec.width = width;
         rec.height = height;
         rec.pivot_x = pivot_x;
@@ -780,16 +815,18 @@ bool BUIReader::Read_Memory(const void* data, size_t size, const std::string& en
     }
 
     const size_t actual_compressed = size - BUI_HEADER_SIZE;
-    if (out.header.compressed_size != actual_compressed) {
+    // Allow trailing alignment padding past the declared compressed size;
+    // only truncation (less data than the header claims) is fatal.
+    if (actual_compressed < out.header.compressed_size) {
         std::ostringstream os;
-        os << "compressed size mismatch: header says " << out.header.compressed_size
+        os << "compressed payload truncated: header says " << out.header.compressed_size
            << ", file has " << actual_compressed << " bytes after 0x24";
         error = os.str();
         return false;
     }
 
     std::vector<uint8_t> inflated;
-    if (!inflate_zlib(raw + BUI_HEADER_SIZE, actual_compressed,
+    if (!inflate_zlib(raw + BUI_HEADER_SIZE, out.header.compressed_size,
                       options.max_inflated_bytes, inflated, error)) {
         return false;
     }

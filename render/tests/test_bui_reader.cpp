@@ -132,6 +132,163 @@ TEST(decode_terminal_layout_record)
     PASS();
 }
 
+// Mutates a known-good BUI image by overwriting the width field of the
+// terminal layout record so we can exercise the upper-bound rejection.
+static std::vector<uint8_t> build_inflated_with_oversize_width()
+{
+    // Mirror build_inflated_with_powerbar_layout but write width=0xFFFF.
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticScene");
+    append_size_prefixed_string(data, "PowerBar");
+
+    append_u32(data, 4u);
+    append_u32(data, 0u);
+    append_u32(data, 5u);
+    append_u32(data, 39u);
+    data.push_back(6);
+    data.push_back(2);
+    append_u16(data, 0xFFFFu);   // width past MAX_DIM
+    data.push_back(7);
+    data.push_back(2);
+    append_u16(data, 606u);
+    data.push_back(8);
+    data.push_back(8);
+    const uint32_t half = 0x3f000000u;
+    append_u32(data, half);
+    append_u32(data, half);
+
+    data.resize(data.size() + 16, 0);
+    return data;
+}
+
+TEST(reject_oversize_layout_dimensions)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_oversize_width());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    // Width 0xFFFF must be rejected by MAX_DIM, leaving zero terminal records
+    // even though the field-block tags still match.
+    EXPECT_EQ(doc.layout_records.size(), static_cast<size_t>(0));
+
+    PASS();
+}
+
+TEST(reject_bad_magic)
+{
+    std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_powerbar_layout());
+    raw[0] = 'X';  // break magic
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_FALSE(reader.Read_Memory(raw.data(), raw.size(),
+                                    "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                    doc, error));
+    EXPECT_TRUE(error.find("magic") != std::string::npos);
+
+    PASS();
+}
+
+TEST(reject_truncated_header)
+{
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    const uint8_t tiny[] = { 'C', 'H', 2, 1 };  // < BUI_HEADER_SIZE
+    EXPECT_FALSE(reader.Read_Memory(tiny, sizeof(tiny),
+                                    "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                    doc, error));
+    EXPECT_TRUE(!error.empty());
+
+    PASS();
+}
+
+TEST(reject_unsupported_version)
+{
+    std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_powerbar_layout());
+    raw[2] = 9;  // major
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_FALSE(reader.Read_Memory(raw.data(), raw.size(),
+                                    "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                    doc, error));
+    EXPECT_TRUE(error.find("version") != std::string::npos);
+
+    PASS();
+}
+
+TEST(reject_compressed_size_mismatch)
+{
+    std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_powerbar_layout());
+    // Bump the declared compressed size by 1 to break the checksum invariant
+    // without producing a complete valid stream.
+    raw[0x10] = static_cast<uint8_t>(raw[0x10] + 1);
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_FALSE(reader.Read_Memory(raw.data(), raw.size(),
+                                    "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                    doc, error));
+    EXPECT_TRUE(error.find("size") != std::string::npos
+                || error.find("inflate") != std::string::npos);
+
+    PASS();
+}
+
+TEST(reject_corrupt_compressed_payload)
+{
+    std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_powerbar_layout());
+    // Corrupt deep inside the deflate stream so size matches but inflate fails.
+    if (raw.size() > 0x30) raw[0x30] ^= 0xff;
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_FALSE(reader.Read_Memory(raw.data(), raw.size(),
+                                    "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                    doc, error));
+
+    PASS();
+}
+
+// Synthesizes a BUI whose payload references a child BUI, so the reader's
+// classifier should pick it up under doc.children + doc.normalized_children.
+static std::vector<uint8_t> build_inflated_with_child_ref()
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+    append_size_prefixed_string(data, "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+    data.resize(data.size() + 16, 0);
+    return data;
+}
+
+TEST(child_bui_reference_resolution)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_child_ref());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\PARENT.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.children.size(), static_cast<size_t>(1));
+    EXPECT_EQ(doc.normalized_children.size(), static_cast<size_t>(1));
+    // Normalize_Entry_Path uppercases and prepends DATA\ if missing.
+    EXPECT_STR_EQ(doc.normalized_children[0].c_str(),
+                  "DATA\\ART\\GUI\\CHILD_PANEL.BUI");
+
+    PASS();
+}
+
 TEST(classify_style_default_record)
 {
     const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_style_default());
