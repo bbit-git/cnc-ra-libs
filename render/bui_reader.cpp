@@ -858,6 +858,69 @@ static std::vector<BUIControlHeader> extract_control_headers(
 
         if (!got_tag1 || !got_tag2) continue;
 
+        // Post-header variant fields use multiple magic words per slot with
+        // variable count, so a structural parse is fragile. The two payload
+        // shapes we care about have distinctive byte patterns and don't
+        // collide with the canonical triple block:
+        //   - `03 04 <u32 child_count>` for groups
+        //   - `<u32 length=strlen+2> <u16 strlen> <printable bytes>` for
+        //     inline texture/text refs
+        // Scan from offset 46 up to (but not including) the canonical
+        // `01 04 <u32 uid>` triple, picking up the first match of each
+        // pattern. Conservative bounds avoid false positives.
+        {
+            const size_t scan_end = std::min(
+                data.size(), header_off + FIXED_HEADER_BYTES + SCAN_MAX);
+            for (size_t c = header_off + 46; c + 6 <= scan_end; ++c) {
+                if (data[c] == 0x01 && data[c + 1] == 0x04) break;
+                // Require the strict 12-byte preamble
+                //   `02 00 00 80  02 00 00 00  06 00 00 00`
+                // before the `03 04 <u32>` child-count tag. That's the
+                // signature used by Tactical_UI's first variant and
+                // TacticalSeamBG's later container slot, and is unique
+                // enough to rule out random `03 04` byte coincidences
+                // inside other tag payloads.
+                if (c >= 12 && data[c] == 0x03 && data[c + 1] == 0x04
+                    && hdr.child_count == 0
+                    && read_u32_le(data.data() + c - 12) == 0x80000002u
+                    && read_u32_le(data.data() + c - 8)  == 0x00000002u
+                    && read_u32_le(data.data() + c - 4)  == 0x00000006u) {
+                    const uint32_t cnt = read_u32_le(data.data() + c + 2);
+                    if (cnt <= 1024) {
+                        hdr.child_count = cnt;
+                    }
+                }
+                if (c >= header_off + 46 + 4 && hdr.inline_ref.empty()
+                    && c + 6 <= scan_end) {
+                    const uint32_t len = read_u32_le(data.data() + c - 4);
+                    const uint16_t strlen = read_u16_le(data.data() + c);
+                    if (len == strlen + 2u && strlen > 0 && strlen <= 64
+                        && c + 2 + strlen <= scan_end) {
+                        bool printable = true;
+                        for (size_t k = 0; k < strlen; ++k) {
+                            if (!is_printable_ascii(data[c + 2 + k])) {
+                                printable = false;
+                                break;
+                            }
+                        }
+                        // Underscore-or-letter start lowers false positives;
+                        // texture tokens always start that way, and so does
+                        // the literal "5,000" we observed (digit start).
+                        if (printable) {
+                            const char first = static_cast<char>(data[c + 2]);
+                            if (std::isalnum(static_cast<unsigned char>(first))
+                                || first == '_') {
+                                hdr.inline_ref.assign(
+                                    reinterpret_cast<const char*>(
+                                        data.data() + c + 2),
+                                    strlen);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Tag-2 interpretation: leaves carry an absolute (or normalized) bbox
         // with non-zero left/top in real cases; grid containers use (0, 0)
         // for the first two components and the per-cell step for w/h.
@@ -1054,6 +1117,83 @@ bool BUIReader::Read_Memory(const void* data, size_t size, const std::string& en
     out.layout_records = extract_layout_records(inflated, out);
     out.instances = extract_instances(inflated, out);
     out.control_headers = extract_control_headers(inflated, out);
+
+    // DFS reconstruction of the kind=0x13 control tree using each record's
+    // `child_count`. Records appear in document order as DFS pre-order:
+    // every record with N children is followed by exactly N immediate
+    // sub-trees. Walking with a stack of `(parent_index, remaining_children)`
+    // lets us assign each record's `parent_index` cheaply.
+    {
+        struct StackEntry {
+            size_t index;
+            uint32_t remaining;
+        };
+        std::vector<StackEntry> stack;
+        for (size_t i = 0; i < out.control_headers.size(); ++i) {
+            BUIControlHeader& h = out.control_headers[i];
+            if (!stack.empty()) {
+                h.parent_index = stack.back().index;
+                stack.back().remaining--;
+                if (stack.back().remaining == 0) stack.pop_back();
+            }
+            if (h.child_count > 0) {
+                stack.push_back({i, h.child_count});
+            }
+        }
+    }
+
+    // Chain tag2 bboxes through parents to compute absolute pixel coords.
+    // The root canvas is the first control whose tag2_kind is GridStep with
+    // (0, 0, ~1, ~1) — i.e. `Tactical_UI`/the BUI canvas. We assume a
+    // 1920×1080 reference resolution since that's what the layout JSON uses;
+    // callers that target a different canvas can rescale.
+    constexpr float REFERENCE_W = 1920.0f;
+    constexpr float REFERENCE_H = 1080.0f;
+    for (size_t i = 0; i < out.control_headers.size(); ++i) {
+        BUIControlHeader& h = out.control_headers[i];
+        if (h.tag2_kind != BUIControlHeader::Tag2Kind::Bbox) continue;
+
+        float ox = 0.0f, oy = 0.0f, sw = REFERENCE_W, sh = REFERENCE_H;
+        // Build the chain of parent bboxes from root to leaf, then apply
+        // tag2 components. Leaves are normalized to their parent's pixel
+        // bbox; chains terminating at a GridStep root use the reference
+        // resolution.
+        std::vector<size_t> chain;
+        size_t cur = h.parent_index;
+        while (cur != static_cast<size_t>(-1)) {
+            chain.push_back(cur);
+            cur = out.control_headers[cur].parent_index;
+        }
+        bool chain_ok = true;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const BUIControlHeader& p = out.control_headers[*it];
+            if (p.tag2_kind == BUIControlHeader::Tag2Kind::Bbox) {
+                ox = ox + p.tag2[0] * sw;
+                oy = oy + p.tag2[1] * sh;
+                sw = p.tag2[2] * sw;
+                sh = p.tag2[3] * sh;
+                if (sw < 1.0f || sh < 1.0f) {
+                    chain_ok = false;
+                    break;
+                }
+            } else if (p.tag2_kind == BUIControlHeader::Tag2Kind::Unknown) {
+                // Single-axis anchors (e.g. RadarMap with tag2=(0.93,0,0,0))
+                // and other unrecognized tag2 shapes mean we can't apply a
+                // meaningful transform. The hierarchy reconstructor's
+                // child_count signal also misclassifies these, so trusting
+                // the chain through them produces wrong numbers. Refuse to
+                // emit an abs for any descendant of an Unknown ancestor.
+                chain_ok = false;
+                break;
+            }
+            // GridStep parents pass (ox, oy, sw, sh) through unchanged.
+        }
+        if (!chain_ok) continue;
+        h.abs_x = ox + h.tag2[0] * sw;
+        h.abs_y = oy + h.tag2[1] * sh;
+        h.abs_width = h.tag2[2] * sw;
+        h.abs_height = h.tag2[3] * sh;
+    }
 
     // Resolve each instance's parent layout record: the most recent
     // BUILayoutRecord whose record_offset precedes the instance. The

@@ -506,6 +506,111 @@ TEST(decode_kind_13_control_header)
     PASS();
 }
 
+// Builds two kind=0x13 controls in a parent/child relationship: a root with
+// an identity (0,0,1,1) tag2 and a child_count=1, followed by a leaf with a
+// non-zero bbox. Verifies the variant decoder + DFS reconstructor link them
+// correctly and the leaf's abs_xy resolves through the root.
+static std::vector<uint8_t> build_inflated_with_hierarchy()
+{
+    std::vector<uint8_t> data(0x95, 0);
+    append_size_prefixed_string(data, "SyntheticParent");
+
+    auto append_control_header = [&](const char* name, uint32_t uid,
+                                     float bx, float by, float bw, float bh,
+                                     uint32_t child_count, bool include_inline_ref) {
+        append_size_prefixed_string(data, name);
+        append_u32(data, 0x13u);
+        append_u32(data, 0x10u);
+        // 32-byte fixed header
+        for (int i = 0; i < 12; ++i) data.push_back(0);
+        append_u32(data, 0x3f800000u);   // f32 1.0
+        append_u32(data, 0x14u);
+        append_u32(data, 0x02u);
+        data.push_back(0); data.push_back(0);
+        append_u32(data, 0x27u);
+        append_u32(data, 0x00u);
+        // 14-byte magic gap (2 zero bytes + u32 1 + u32 0x80000002 + u32 2)
+        // observed on every real kind=0x13 between the fixed header and
+        // the first variant length.
+        data.push_back(0); data.push_back(0);
+        append_u32(data, 0x00000001u);
+        append_u32(data, 0x80000002u);
+        append_u32(data, 0x00000002u);
+        // Optional inline ref variant (renderable shape)
+        if (include_inline_ref) {
+            append_u32(data, 0x07u);             // length 7
+            append_u16(data, 0x0005u);           // strlen 5
+            data.push_back('h'); data.push_back('e'); data.push_back('l');
+            data.push_back('l'); data.push_back('o');
+        }
+        // Strict child-count signature
+        if (child_count > 0) {
+            append_u32(data, 0x80000002u);
+            append_u32(data, 0x00000002u);
+            append_u32(data, 0x00000006u);
+            data.push_back(0x03); data.push_back(0x04);
+            append_u32(data, child_count);
+        }
+        // Padding before triple block
+        for (int i = 0; i < 16; ++i) data.push_back(0);
+        // Triple block
+        data.push_back(0x01); data.push_back(0x04); append_u32(data, uid);
+        data.push_back(0x02); data.push_back(0x10);
+        auto append_f32 = [&](float v) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            append_u32(data, bits);
+        };
+        append_f32(bx);
+        append_f32(by);
+        append_f32(bw);
+        append_f32(bh);
+        data.push_back(0x03); data.push_back(0x10);
+        append_f32(1.0f);
+        append_f32(1.0f);
+        append_f32(1.0f);
+        append_f32(1.0f);
+    };
+
+    // Root: GridStep (0,0,1,1) with 1 child.
+    append_control_header("RootCanvas", 0x11111111u, 0.0f, 0.0f, 1.0f, 1.0f, 1, false);
+    // Leaf: bbox (0.5, 0.25, 0.25, 0.5) with no children, using inline ref.
+    append_control_header("LeafQuad", 0x22222222u, 0.5f, 0.25f, 0.25f, 0.5f, 0, true);
+
+    data.resize(data.size() + 32, 0);
+    return data;
+}
+
+TEST(decode_kind_13_hierarchy)
+{
+    const std::vector<uint8_t> raw = wrap_as_bui(build_inflated_with_hierarchy());
+
+    BUIReader reader;
+    BUIDocument doc;
+    std::string error;
+    EXPECT_TRUE(reader.Read_Memory(raw.data(), raw.size(),
+                                   "DATA\\ART\\GUI\\SYNTHETIC.BUI",
+                                   doc, error));
+    EXPECT_EQ(doc.control_headers.size(), static_cast<size_t>(2));
+
+    const BUIControlHeader& root = doc.control_headers[0];
+    const BUIControlHeader& leaf = doc.control_headers[1];
+
+    EXPECT_EQ(root.parent_index, static_cast<size_t>(-1));
+    EXPECT_EQ(root.child_count, 1u);
+    EXPECT_EQ(leaf.parent_index, static_cast<size_t>(0));
+    EXPECT_STR_EQ(leaf.inline_ref.c_str(), "hello");
+
+    // Root tag2 is (0,0,1,1) → GridStep, passes through. Leaf abs = leaf
+    // bbox × reference resolution (1920×1080) — w=480, h=540, x=960, y=270.
+    EXPECT_NEAR(leaf.abs_x,      960.0f, 0.5f);
+    EXPECT_NEAR(leaf.abs_y,      270.0f, 0.5f);
+    EXPECT_NEAR(leaf.abs_width,  480.0f, 0.5f);
+    EXPECT_NEAR(leaf.abs_height, 540.0f, 0.5f);
+
+    PASS();
+}
+
 // A kind=0x0c record without the `0d 10` marker must be rejected. Builds an
 // otherwise-valid instance record and zeroes the marker bytes.
 static std::vector<uint8_t> build_inflated_with_bad_instance_marker()

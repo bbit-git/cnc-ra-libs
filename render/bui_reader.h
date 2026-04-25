@@ -161,6 +161,27 @@ struct BUIControlHeader {
     float tag2[4] = {0, 0, 0, 0};
     float tag3[4] = {0, 0, 0, 0};
     Tag2Kind tag2_kind = Tag2Kind::Unknown;
+
+    // Variant payload at offset 46 of the kind=0x13 record's payload.
+    // Group records carry `03 04 <u32 child_count>` here; renderable records
+    // carry an inline `<u16 strlen><name>` (e.g. a texture token like
+    // "ui_sidebar_radarbg" or a literal label like "5,000"). At most one of
+    // `child_count` / `inline_ref` is populated per record.
+    uint32_t child_count = 0;
+    std::string inline_ref;
+
+    // DFS-reconstructed structural parent: the kind=0x13 record whose
+    // child_count >= 1 directly encloses this one. `(size_t)-1` for the
+    // scene root.
+    size_t parent_index = static_cast<size_t>(-1);
+
+    // Absolute-pixel bounding box, computed by chaining tag2 bboxes through
+    // parents. Only valid when `tag2_kind == Bbox` and the parent chain
+    // resolves cleanly to a root canvas. Zero otherwise.
+    float abs_x = 0.0f;
+    float abs_y = 0.0f;
+    float abs_width = 0.0f;
+    float abs_height = 0.0f;
 };
 
 struct BUIDocument {
